@@ -614,6 +614,7 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         let pending_keystrokes_indicator =
             cx.new(|cx| which_key::PendingKeystrokesIndicator::new(window, cx));
         let image_info = cx.new(|_cx| ImageInfo::new(workspace));
+        let dotnet_run_configuration = dotnet::register(workspace, window, cx);
 
         let lsp_button_menu_handle = PopoverMenuHandle::default();
         let lsp_button =
@@ -646,6 +647,7 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             status_bar.add_right_item(line_ending_indicator, window, cx);
             status_bar.add_right_item(cursor_position, window, cx);
             status_bar.add_right_item(image_info, window, cx);
+            status_bar.add_right_item(dotnet_run_configuration, window, cx);
             // Keep these last so they stay leftmost and can change without moving the other items.
             status_bar.add_right_item(vim_mode_indicator, window, cx);
             status_bar.add_right_item(pending_keystrokes_indicator, window, cx);

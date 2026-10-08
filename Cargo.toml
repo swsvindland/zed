@@ -56,6 +56,7 @@ members = [
     "crates/dev_container",
     "crates/diagnostics",
     "crates/docs_preprocessor",
+    "crates/dotnet",
     "crates/edit_prediction",
     "crates/edit_prediction_cli",
     "crates/edit_prediction_context",
@@ -335,6 +336,7 @@ deepseek = { path = "crates/deepseek" }
 derive_refineable = { path = "crates/refineable/derive_refineable" }
 dev_container = { path = "crates/dev_container" }
 diagnostics = { path = "crates/diagnostics" }
+dotnet = { path = "crates/dotnet" }
 edit_prediction = { path = "crates/edit_prediction" }
 edit_prediction_context = { path = "crates/edit_prediction_context" }
 edit_prediction_metrics = { path = "crates/edit_prediction_metrics", features = ["tree-sitter"] }
