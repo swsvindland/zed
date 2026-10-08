@@ -935,7 +935,7 @@ impl TitleBar {
     ) -> Option<AnyElement> {
         let workspace = self.workspace.upgrade()?;
 
-        let (branch_name, icon_info, is_detached_head) = {
+        let (branch_name, icon_info, is_detached_head, is_svn) = {
             let repo = repository.read(cx);
 
             let is_detached_head = repo.branch.is_none();
@@ -969,7 +969,7 @@ impl TitleBar {
                 (IconName::GitBranch, Color::Muted)
             };
 
-            (branch_name, icon_info, is_detached_head)
+            (branch_name, icon_info, is_detached_head, repo.is_svn())
         };
 
         let settings = TitleBarSettings::get_global(cx);
@@ -997,7 +997,8 @@ impl TitleBar {
             worktree_label.clone()
         };
 
-        let worktree_button = settings.show_worktree_name.then(|| {
+        // Subversion working copies have no git worktrees to pick from.
+        let worktree_button = (settings.show_worktree_name && !is_svn).then(|| {
             let project = self.project.clone();
             let workspace_handle = workspace.downgrade();
             PopoverMenu::new("worktree-picker-menu")

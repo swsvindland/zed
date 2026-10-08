@@ -6163,9 +6163,17 @@ impl GitPanel {
         };
 
         let is_push = matches!(action, RemoteAction::Push(_, _));
+        let is_svn = self
+            .active_repository
+            .as_ref()
+            .is_some_and(|repository| repository.read(cx).is_svn());
 
         workspace.update(cx, |workspace, cx| {
-            let SuccessMessage { message, style } = remote_output::format_output(&action, info);
+            let SuccessMessage { message, style } = if is_svn {
+                remote_output::format_svn_output(info)
+            } else {
+                remote_output::format_output(&action, info)
+            };
             let workspace_weak = cx.weak_entity();
             let operation = action.name();
 
@@ -6738,7 +6746,9 @@ impl GitPanel {
     }
 
     pub(crate) fn render_remote_button(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let branch = self.active_repository.as_ref()?.read(cx).branch.clone();
+        let repository = self.active_repository.as_ref()?.read(cx);
+        let branch = repository.branch.clone();
+        let is_svn = repository.is_svn();
         if !self.can_push_and_pull(cx) {
             return None;
         }
@@ -6754,6 +6764,7 @@ impl GitPanel {
                         &branch,
                         focus_handle,
                         true,
+                        is_svn,
                         self.pending_remote_operation,
                         self.remote_action_menu_handle.clone(),
                     ))
@@ -7078,6 +7089,7 @@ impl GitPanel {
         let active_repository = self.active_repository.as_ref()?;
         let branch = active_repository.read(cx).branch.as_ref()?;
         let commit = branch.most_recent_commit.as_ref()?.clone();
+        let is_svn = active_repository.read(cx).is_svn();
         let workspace = self.workspace.clone();
         let this = cx.entity();
 
@@ -7157,20 +7169,25 @@ impl GitPanel {
                                     ),
                             )
                         })
-                        .child(
-                            IconButton::new("git-graph-button", IconName::GitGraph)
-                                .icon_size(IconSize::Small)
-                                .tooltip(|_window, cx| {
-                                    Tooltip::for_action(
-                                        "Open Git Graph",
-                                        &crate::git_graph::Open,
-                                        cx,
-                                    )
-                                })
-                                .on_click(|_, window, cx| {
-                                    window.dispatch_action(crate::git_graph::Open.boxed_clone(), cx)
-                                }),
-                        ),
+                        .when(!is_svn, |this| {
+                            this.child(
+                                IconButton::new("git-graph-button", IconName::GitGraph)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(|_window, cx| {
+                                        Tooltip::for_action(
+                                            "Open Git Graph",
+                                            &crate::git_graph::Open,
+                                            cx,
+                                        )
+                                    })
+                                    .on_click(|_, window, cx| {
+                                        window.dispatch_action(
+                                            crate::git_graph::Open.boxed_clone(),
+                                            cx,
+                                        )
+                                    }),
+                            )
+                        }),
                 ),
         )
     }

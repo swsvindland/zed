@@ -5,6 +5,7 @@ mod remote;
 pub mod repository;
 pub mod stash;
 pub mod status;
+pub mod svn;
 
 pub use crate::hosting_provider::*;
 pub use crate::remote::*;
@@ -17,6 +18,7 @@ use std::fmt::{self, Write as _};
 use std::str::FromStr;
 
 pub const DOT_GIT: &str = ".git";
+pub const DOT_SVN: &str = ".svn";
 pub const GITIGNORE: &str = ".gitignore";
 pub const FSMONITOR_DAEMON: &str = "fsmonitor--daemon";
 pub const LFS_DIR: &str = "lfs";
@@ -179,6 +181,9 @@ const SHA256_BYTE_LENGTH: usize = 32;
 const SHA1_HEX_LENGTH: usize = SHA1_BYTE_LENGTH * 2;
 const SHA256_HEX_LENGTH: usize = SHA256_BYTE_LENGTH * 2;
 const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+/// Hex encoding of `"SVN\0"`, marking an [`Oid`] that holds a Subversion revision.
+const SVN_REVISION_SUFFIX: &str = "53564e00";
+const SVN_REVISION_DIGITS: usize = SHA1_HEX_LENGTH - SVN_REVISION_SUFFIX.len();
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub struct Oid {
@@ -242,13 +247,55 @@ impl Oid {
         &self.bytes[..self.format.byte_len()]
     }
 
+    /// The all-zero SHA-1 id, which blame uses for lines that aren't committed yet.
+    pub fn zero() -> Self {
+        Self {
+            bytes: [0; SHA256_BYTE_LENGTH],
+            format: OidFormat::Sha1,
+        }
+    }
+
     pub fn is_zero(&self) -> bool {
         self.as_bytes().iter().all(|byte| *byte == 0)
     }
 
-    /// Returns this [`Oid`] as a short SHA.
+    /// Returns this [`Oid`] as a short SHA, or as `r<revision>` for Subversion revisions.
     pub fn display_short(&self) -> String {
+        if let Some(revision) = self.svn_revision() {
+            return format!("r{revision}");
+        }
         self.hex_string(SHORT_SHA_LENGTH)
+    }
+
+    /// Subversion identifies commits by revision number, which is encoded into a SHA-1
+    /// sized id so that it can flow through the same code paths as git commits. The
+    /// decimal digits come first so that UI which truncates SHAs still shows the revision.
+    pub fn from_svn_revision(revision: u64) -> Self {
+        let hex = format!("{revision:f<SVN_REVISION_DIGITS$}{SVN_REVISION_SUFFIX}");
+        let mut bytes = [0u8; SHA256_BYTE_LENGTH];
+        for (index, digit) in hex.bytes().filter_map(decode_hex_digit).enumerate() {
+            if index % 2 == 0 {
+                bytes[index / 2] = digit << 4;
+            } else {
+                bytes[index / 2] |= digit;
+            }
+        }
+        Self {
+            bytes,
+            format: OidFormat::Sha1,
+        }
+    }
+
+    pub fn svn_revision(&self) -> Option<u64> {
+        if self.format != OidFormat::Sha1 {
+            return None;
+        }
+        let hex = self.hex_string(SHA1_HEX_LENGTH);
+        let digits = hex.strip_suffix(SVN_REVISION_SUFFIX)?.trim_end_matches('f');
+        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        digits.parse().ok()
     }
 
     fn hex_string(&self, len: usize) -> String {
@@ -392,6 +439,20 @@ mod tests {
 
         assert_eq!(oid.as_bytes().len(), SHA256_BYTE_LENGTH);
         assert_eq!(oid.to_string(), sha);
+    }
+
+    #[test]
+    fn round_trips_svn_revisions() {
+        let oid = Oid::from_svn_revision(1234);
+        assert_eq!(oid.svn_revision(), Some(1234));
+        assert_eq!(oid.display_short(), "r1234");
+        assert!(oid.to_string().starts_with("1234ff"));
+        assert_eq!(
+            oid.to_string().parse::<Oid>().unwrap().svn_revision(),
+            Some(1234)
+        );
+        assert_eq!(Oid::from_svn_revision(0).svn_revision(), Some(0));
+        assert_eq!("abc1234".parse::<Oid>().unwrap().svn_revision(), None);
     }
 
     #[test]

@@ -79,6 +79,22 @@ fn extract_url(line: &str) -> Option<String> {
     Some(url.to_string())
 }
 
+/// Subversion prints a one-line summary such as "Updated to revision 12." last.
+pub fn format_svn_output(output: RemoteCommandOutput) -> SuccessMessage {
+    let message = output
+        .stdout
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("Done")
+        .to_string();
+    SuccessMessage {
+        message,
+        style: SuccessStyle::ToastWithLog { output },
+    }
+}
+
 pub fn format_output(action: &RemoteAction, output: RemoteCommandOutput) -> SuccessMessage {
     match action {
         RemoteAction::Fetch(remote) => {

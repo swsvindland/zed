@@ -781,16 +781,25 @@ impl LocalRepositoryState {
                     HashMap::default()
                 });
         let search_paths = environment.get("PATH").map(|val| val.to_owned());
+        let binary_name = if git::svn::is_svn_admin_dir(&dot_git_abs_path) {
+            "svn"
+        } else {
+            "git"
+        };
         let backend = cx
             .background_spawn({
                 let fs = fs.clone();
                 async move {
                     let system_git_binary_path = search_paths
                         .and_then(|search_paths| {
-                            which::which_in("git", Some(search_paths), &work_directory_abs_path)
-                                .ok()
+                            which::which_in(
+                                binary_name,
+                                Some(search_paths),
+                                &work_directory_abs_path,
+                            )
+                            .ok()
                         })
-                        .or_else(|| which::which("git").ok());
+                        .or_else(|| which::which(binary_name).ok());
                     fs.open_repo(&dot_git_abs_path, system_git_binary_path.as_deref())
                         .with_context(|| format!("opening repository at {dot_git_abs_path:?}"))
                 }
@@ -6297,6 +6306,13 @@ impl RepositorySnapshot {
                 .map(worktree_to_proto)
                 .collect(),
         }
+    }
+
+    /// Whether this is a Subversion working copy rather than a git repository.
+    pub fn is_svn(&self) -> bool {
+        self.path_style
+            .file_name(self.repository_dir_abs_path.as_ref())
+            .is_some_and(|file_name| file_name == std::ffi::OsStr::new(git::DOT_SVN))
     }
 
     /// Returns the main worktree path for this repository, if one exists.

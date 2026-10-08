@@ -144,6 +144,24 @@ pub struct CommitDataReader {
 }
 
 impl CommitDataReader {
+    /// Creates a reader that answers each request by awaiting `resolve`.
+    pub(crate) fn new<F, R>(executor: &BackgroundExecutor, resolve: R) -> Self
+    where
+        R: 'static + Send + Fn(Oid) -> F,
+        F: Future<Output = Result<CommitData>> + Send,
+    {
+        let (request_tx, request_rx) = async_channel::bounded::<CommitDataRequest>(64);
+        let task = executor.spawn(async move {
+            while let Ok(CommitDataRequest { sha, response_tx }) = request_rx.recv().await {
+                response_tx.send(resolve(sha).await).ok();
+            }
+        });
+        Self {
+            request_tx,
+            _task: task,
+        }
+    }
+
     pub async fn read(&self, sha: Oid) -> Result<CommitData> {
         let (response_tx, response_rx) = oneshot::channel();
         self.request_tx

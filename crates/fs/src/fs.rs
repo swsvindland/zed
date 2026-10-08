@@ -181,6 +181,9 @@ pub trait Fs: Send + Sync {
         Arc<dyn Watcher>,
     );
 
+    /// Opens the repository whose metadata directory is `abs_dot_git`, which is either a
+    /// git directory or a Subversion working copy's `.svn` directory.
+    /// `system_git_binary_path` is the matching `git` or `svn` binary.
     fn open_repo(
         &self,
         abs_dot_git: &Path,
@@ -1233,6 +1236,13 @@ impl Fs for RealFs {
         dotgit_path: &Path,
         system_git_binary_path: Option<&Path>,
     ) -> Result<Arc<dyn GitRepository>> {
+        if git::svn::is_svn_admin_dir(dotgit_path) {
+            return Ok(Arc::new(git::svn::SvnRepository::new(
+                dotgit_path,
+                system_git_binary_path.map(Path::to_path_buf),
+                self.executor.clone(),
+            )?));
+        }
         Ok(Arc::new(RealGitRepository::new(
             dotgit_path,
             self.bundled_git_binary_path.clone(),

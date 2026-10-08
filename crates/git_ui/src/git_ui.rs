@@ -946,11 +946,30 @@ fn render_remote_button(
     branch: &Branch,
     keybinding_target: Option<FocusHandle>,
     show_fetch_button: bool,
+    is_svn: bool,
     in_progress_operation: Option<RemoteOperationKind>,
     menu_handle: PopoverMenuHandle<ContextMenu>,
 ) -> Option<impl IntoElement> {
     let id = id.into();
     let upstream = branch.upstream.as_ref();
+    if is_svn {
+        // Subversion commits go straight to the server, so the only remote operation
+        // is updating the working copy.
+        let behind = match upstream {
+            Some(Upstream {
+                tracking: UpstreamTracking::Tracked(UpstreamTrackingStatus { behind, .. }),
+                ..
+            }) => *behind,
+            _ => 0,
+        };
+        return Some(remote_button::render_update_button(
+            keybinding_target,
+            id,
+            behind,
+            in_progress_operation,
+            menu_handle,
+        ));
+    }
     match upstream {
         Some(Upstream {
             tracking: UpstreamTracking::Tracked(UpstreamTrackingStatus { ahead, behind }),
@@ -1005,6 +1024,38 @@ mod remote_button {
         PopoverMenuHandle, SplitButton, Tooltip, prelude::*,
     };
 
+    pub fn render_update_button(
+        keybinding_target: Option<FocusHandle>,
+        id: SharedString,
+        behind: u32,
+        in_progress_operation: Option<RemoteOperationKind>,
+        menu_handle: PopoverMenuHandle<ContextMenu>,
+    ) -> SplitButton {
+        split_button(
+            id,
+            "Update",
+            0,
+            behind as usize,
+            (behind == 0).then_some(IconName::ArrowCircle),
+            keybinding_target.clone(),
+            in_progress_operation,
+            menu_handle,
+            true,
+            move |_, window, cx| {
+                window.dispatch_action(Box::new(git::Pull), cx);
+            },
+            move |_window, cx| {
+                git_action_tooltip(
+                    "Update the working copy from the server",
+                    &git::Pull,
+                    "svn update",
+                    keybinding_target.clone(),
+                    cx,
+                )
+            },
+        )
+    }
+
     pub fn render_fetch_button(
         keybinding_target: Option<FocusHandle>,
         id: SharedString,
@@ -1020,6 +1071,7 @@ mod remote_button {
             keybinding_target.clone(),
             in_progress_operation,
             menu_handle,
+            false,
             move |_, window, cx| {
                 window.dispatch_action(Box::new(git::Fetch), cx);
             },
@@ -1051,6 +1103,7 @@ mod remote_button {
             keybinding_target.clone(),
             in_progress_operation,
             menu_handle,
+            false,
             move |_, window, cx| {
                 window.dispatch_action(Box::new(git::Push), cx);
             },
@@ -1083,6 +1136,7 @@ mod remote_button {
             keybinding_target.clone(),
             in_progress_operation,
             menu_handle,
+            false,
             move |_, window, cx| {
                 window.dispatch_action(Box::new(git::Pull), cx);
             },
@@ -1113,6 +1167,7 @@ mod remote_button {
             keybinding_target.clone(),
             in_progress_operation,
             menu_handle,
+            false,
             move |_, window, cx| {
                 window.dispatch_action(Box::new(git::Push), cx);
             },
@@ -1143,6 +1198,7 @@ mod remote_button {
             keybinding_target.clone(),
             in_progress_operation,
             menu_handle,
+            false,
             move |_, window, cx| {
                 window.dispatch_action(Box::new(git::Push), cx);
             },
@@ -1158,8 +1214,10 @@ mod remote_button {
         )
     }
 
-    fn in_progress_tooltip(operation: RemoteOperationKind) -> &'static str {
+    fn in_progress_tooltip(operation: RemoteOperationKind, is_svn: bool) -> &'static str {
         match operation {
+            RemoteOperationKind::Fetch if is_svn => "Checking for Updates…",
+            RemoteOperationKind::Pull if is_svn => "Update in Progress…",
             RemoteOperationKind::Fetch => "Fetch in Progress…",
             RemoteOperationKind::Pull => "Pull in Progress…",
             RemoteOperationKind::Push => "Push in Progress…",
@@ -1187,6 +1245,7 @@ mod remote_button {
         id: impl Into<ElementId>,
         keybinding_target: Option<FocusHandle>,
         menu_handle: PopoverMenuHandle<ContextMenu>,
+        is_svn: bool,
     ) -> impl IntoElement {
         let menu_open = menu_handle.is_deployed();
 
@@ -1198,10 +1257,16 @@ mod remote_button {
             .with_handle(menu_handle)
             .menu(move |window, cx| {
                 Some(ContextMenu::build(window, cx, |context_menu, _, _| {
-                    context_menu
+                    let context_menu = context_menu
                         .when_some(keybinding_target.clone(), |el, keybinding_target| {
                             el.context(keybinding_target)
-                        })
+                        });
+                    if is_svn {
+                        return context_menu
+                            .action("Check for Updates", git::Fetch.boxed_clone())
+                            .action("Update", git::Pull.boxed_clone());
+                    }
+                    context_menu
                         .action("Fetch", git::Fetch.boxed_clone())
                         .action("Fetch From", git::FetchFrom.boxed_clone())
                         .action("Pull", git::Pull.boxed_clone())
@@ -1229,6 +1294,7 @@ mod remote_button {
         keybinding_target: Option<FocusHandle>,
         in_progress_operation: Option<RemoteOperationKind>,
         menu_handle: PopoverMenuHandle<ContextMenu>,
+        is_svn: bool,
         left_on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
         tooltip: impl Fn(&mut Window, &mut App) -> AnyView + 'static,
     ) -> SplitButton {
@@ -1289,7 +1355,7 @@ mod remote_button {
             .on_click(left_on_click)
             .tooltip(move |window, cx| {
                 if let Some(operation) = in_progress_operation {
-                    Tooltip::simple(in_progress_tooltip(operation), cx)
+                    Tooltip::simple(in_progress_tooltip(operation, is_svn), cx)
                 } else {
                     tooltip(window, cx)
                 }
@@ -1299,6 +1365,7 @@ mod remote_button {
             format!("split-button-right-{}", id),
             keybinding_target,
             menu_handle,
+            is_svn,
         )
         .into_any_element();
 
