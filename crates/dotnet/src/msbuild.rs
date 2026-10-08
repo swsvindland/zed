@@ -10,6 +10,15 @@ pub const SOLUTION_EXTENSIONS: &[&str] = &["sln", "slnx"];
 /// The project type GUID Visual Studio uses for ASP.NET (System.Web) web application projects.
 const WEB_APPLICATION_PROJECT_TYPE: &str = "349c5851-65df-11da-9384-00065b846f21";
 
+/// Item types that refer to assemblies or packages rather than to files in the project.
+const REFERENCE_ITEM_TYPES: &[&str] = &[
+    "Reference",
+    "ProjectReference",
+    "PackageReference",
+    "COMReference",
+    "Analyzer",
+];
+
 /// SDKs whose projects default to `<OutputType>Exe</OutputType>`.
 const EXECUTABLE_SDKS: &[&str] = &[
     "Microsoft.NET.Sdk.Web",
@@ -49,6 +58,11 @@ pub struct MsBuildProject {
     pub web: Option<LegacyWebProject>,
     /// Names of the `launchSettings.json` profiles that `dotnet run` can start.
     pub launch_profiles: Vec<String>,
+    /// The `bin` and `obj` directories, relative to the project directory.
+    pub output_directories: Vec<String>,
+    /// The files a legacy project lists, relative to the project directory and possibly containing
+    /// wildcards. SDK-style projects include the files in their directory instead.
+    pub items: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -68,6 +82,8 @@ pub struct Solution {
     pub path: PathBuf,
     pub name: String,
     pub projects: Vec<PathBuf>,
+    /// Files added to the solution itself, such as `Directory.Build.props`.
+    pub items: Vec<PathBuf>,
 }
 
 impl Solution {
@@ -187,8 +203,8 @@ pub fn parse_project(path: &Path, contents: &str) -> Result<MsBuildProject> {
         .map(str::to_owned)
         .unwrap_or_else(|| name.clone());
 
-    let (target_frameworks, output_path, web) = match style {
-        ProjectStyle::Sdk => (target_frameworks.unwrap_or_default(), None, None),
+    let (target_frameworks, output_path, web, items) = match style {
+        ProjectStyle::Sdk => (target_frameworks.unwrap_or_default(), None, None, None),
         ProjectStyle::Legacy => {
             let target_framework_version = unconditional_property(root, "TargetFrameworkVersion")
                 .map(|version| vec![version.to_owned()])
@@ -197,9 +213,23 @@ pub fn parse_project(path: &Path, contents: &str) -> Result<MsBuildProject> {
                 target_framework_version,
                 Some(debug_output_path(root)),
                 legacy_web_project(root),
+                Some(item_includes(root)),
             )
         }
     };
+
+    let output_directories = [
+        ("BaseOutputPath", "bin\\"),
+        ("BaseIntermediateOutputPath", "obj\\"),
+    ]
+    .into_iter()
+    .map(|(property, default)| {
+        unconditional_property(root, property)
+            .filter(|path| !path.contains("$("))
+            .unwrap_or(default)
+            .to_owned()
+    })
+    .collect();
 
     Ok(MsBuildProject {
         path: path.to_path_buf(),
@@ -211,7 +241,45 @@ pub fn parse_project(path: &Path, contents: &str) -> Result<MsBuildProject> {
         output_path,
         web,
         launch_profiles: Vec::new(),
+        output_directories,
+        items,
     })
+}
+
+fn item_includes(root: &XmlElement) -> Vec<String> {
+    root.children_named("ItemGroup")
+        .flat_map(|group| &group.children)
+        .filter(|item| !REFERENCE_ITEM_TYPES.contains(&item.name.as_str()))
+        .filter_map(|item| item.attribute("Include"))
+        .flat_map(|include| include.split(';'))
+        .map(|include| unescape_msbuild(include.trim()))
+        .filter(|include| !include.is_empty() && !include.contains("$(") && !include.contains("@("))
+        .collect()
+}
+
+/// Decodes MSBuild's `%XX` escapes, such as `%20` for a space or `%3B` for a semicolon.
+fn unescape_msbuild(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut unescaped = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let escaped = (bytes[index] == b'%')
+            .then(|| bytes.get(index + 1..index + 3))
+            .flatten()
+            .and_then(|hex| std::str::from_utf8(hex).ok())
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match escaped {
+            Some(byte) => {
+                unescaped.push(byte);
+                index += 3;
+            }
+            None => {
+                unescaped.push(bytes[index]);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&unescaped).into_owned()
 }
 
 /// Returns the last value MSBuild would assign to `name` regardless of the build configuration.
@@ -320,56 +388,78 @@ pub fn parse_solution(path: &Path, contents: &str) -> Result<Solution> {
     let is_slnx = path
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("slnx"));
-    let relative_paths = if is_slnx {
-        slnx_project_paths(contents)?
+    let (project_paths, item_paths) = if is_slnx {
+        slnx_paths(contents)?
     } else {
-        sln_project_paths(contents)
+        sln_paths(contents)
     };
     let directory = path.parent().unwrap_or(Path::new(""));
     Ok(Solution {
         path: path.to_path_buf(),
         name: file_stem(path),
-        projects: relative_paths
+        projects: project_paths
             .iter()
             .map(|relative_path| resolve_msbuild_path(directory, relative_path))
             .filter(|path| is_project_file(path))
             .collect(),
+        items: item_paths
+            .iter()
+            .map(|relative_path| resolve_msbuild_path(directory, relative_path))
+            .collect(),
     })
 }
 
-/// Extracts the paths from `Project("{type}") = "Name", "Path\Name.csproj", "{guid}"` lines.
-fn sln_project_paths(contents: &str) -> Vec<String> {
-    contents
-        .lines()
-        .filter_map(|line| {
-            let declaration = line.trim_start().strip_prefix("Project(")?;
-            let (_, values) = declaration.split_once('=')?;
+/// Extracts the paths of `Project("{type}") = "Name", "Path\Name.csproj", "{guid}"` lines, and
+/// of the files listed in `ProjectSection(SolutionItems)` sections.
+fn sln_paths(contents: &str) -> (Vec<String>, Vec<String>) {
+    let mut project_paths = Vec::new();
+    let mut item_paths = Vec::new();
+    let mut in_solution_items = false;
+    for line in contents.lines() {
+        let line = line.trim();
+        if in_solution_items {
+            if line == "EndProjectSection" {
+                in_solution_items = false;
+            } else if let Some((path, _)) = line.split_once('=') {
+                item_paths.push(path.trim().to_owned());
+            }
+        } else if line.starts_with("ProjectSection(SolutionItems)") {
+            in_solution_items = true;
+        } else if let Some(declaration) = line.strip_prefix("Project(")
+            && let Some((_, values)) = declaration.split_once('=')
+        {
             let mut values = values
                 .split(',')
                 .map(|value| value.trim().trim_matches('"'));
-            let _name = values.next()?;
-            Some(values.next()?.to_owned())
-        })
-        .collect()
+            let _name = values.next();
+            if let Some(path) = values.next() {
+                project_paths.push(path.to_owned());
+            }
+        }
+    }
+    (project_paths, item_paths)
 }
 
-fn slnx_project_paths(contents: &str) -> Result<Vec<String>> {
-    fn collect(element: &XmlElement, paths: &mut Vec<String>) {
+fn slnx_paths(contents: &str) -> Result<(Vec<String>, Vec<String>)> {
+    fn collect(
+        element: &XmlElement,
+        project_paths: &mut Vec<String>,
+        item_paths: &mut Vec<String>,
+    ) {
         for child in &element.children {
-            if child.name == "Project" {
-                if let Some(path) = child.attribute("Path") {
-                    paths.push(path.to_owned());
-                }
-            } else {
-                collect(child, paths);
+            match (child.name.as_str(), child.attribute("Path")) {
+                ("Project", Some(path)) => project_paths.push(path.to_owned()),
+                ("File", Some(path)) => item_paths.push(path.to_owned()),
+                _ => collect(child, project_paths, item_paths),
             }
         }
     }
 
     let document = parse_xml(contents)?;
-    let mut paths = Vec::new();
-    collect(&document, &mut paths);
-    Ok(paths)
+    let mut project_paths = Vec::new();
+    let mut item_paths = Vec::new();
+    collect(&document, &mut project_paths, &mut item_paths);
+    Ok((project_paths, item_paths))
 }
 
 /// Finds the IIS Express site serving `project` in an `applicationhost.config` file written by
@@ -888,6 +978,8 @@ mod tests {
                     development_server_port: Some(51234),
                 }),
                 launch_profiles: Vec::new(),
+                output_directories: vec!["bin\\".into(), "obj\\".into()],
+                items: Some(vec!["Global.asax.cs".into()]),
             }
         );
         assert_eq!(
@@ -898,6 +990,49 @@ mod tests {
             vec!["Shop.Web (IIS Express)"]
         );
         assert_eq!(run_configurations(&project, false), Vec::new());
+    }
+
+    #[test]
+    fn parses_items_and_output_directories() {
+        let legacy = parse_project(
+            &root().join("Legacy").join("Legacy.csproj"),
+            indoc! {r#"
+                <Project ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+                  <ItemGroup>
+                    <Reference Include="System.Web" />
+                    <Compile Include="Default.aspx.cs;Site%20Master.cs" />
+                    <Content Include="Scripts\**\*.js" />
+                    <Folder Include="App_Data\" />
+                    <ProjectReference Include="..\Core\Core.csproj" />
+                  </ItemGroup>
+                </Project>
+            "#},
+        )
+        .unwrap();
+        assert_eq!(
+            legacy.items,
+            Some(vec![
+                "Default.aspx.cs".into(),
+                "Site Master.cs".into(),
+                "Scripts\\**\\*.js".into(),
+                "App_Data\\".into(),
+            ])
+        );
+
+        let sdk = parse_project(
+            &root().join("Api").join("Api.csproj"),
+            indoc! {r#"
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup>
+                    <TargetFramework>net8.0</TargetFramework>
+                    <BaseOutputPath>build\</BaseOutputPath>
+                  </PropertyGroup>
+                </Project>
+            "#},
+        )
+        .unwrap();
+        assert_eq!(sdk.items, None);
+        assert_eq!(sdk.output_directories, vec!["build\\", "obj\\"]);
     }
 
     #[test]
@@ -1042,6 +1177,10 @@ mod tests {
                 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Shop.Web", "Shop.Web\Shop.Web.csproj", "{5B3C1A31-4C8D-4D7A-9F8A-1B3C4D5E6F70}"
                 EndProject
                 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Solution Items", "Solution Items", "{8C1E2D3F-4A5B-6C7D-8E9F-0A1B2C3D4E5F}"
+                    ProjectSection(SolutionItems) = preProject
+                        Directory.Build.props = Directory.Build.props
+                        build\common.props = build\common.props
+                    EndProjectSection
                 EndProject
                 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "Shared", "..\Shared\Shared.csproj", "{1A2B3C4D-5E6F-7081-92A3-B4C5D6E7F809}"
                 EndProject
@@ -1063,6 +1202,13 @@ mod tests {
             ]
         );
         assert!(sln.contains(&root().join("Shop.Web").join("Shop.Web.csproj")));
+        assert_eq!(
+            sln.items,
+            vec![
+                root().join("Directory.Build.props"),
+                root().join("build").join("common.props"),
+            ]
+        );
 
         let slnx = parse_solution(
             &root().join("App.slnx"),
@@ -1072,6 +1218,9 @@ mod tests {
                     <Project Path="src/Api/Api.csproj" />
                   </Folder>
                   <Project Path="tests\Api.Tests\Api.Tests.csproj" />
+                  <Folder Name="/Solution Items/">
+                    <File Path="global.json" />
+                  </Folder>
                 </Solution>
             "#},
         )
@@ -1086,6 +1235,7 @@ mod tests {
                     .join("Api.Tests.csproj"),
             ]
         );
+        assert_eq!(slnx.items, vec![root().join("global.json")]);
     }
 
     #[test]

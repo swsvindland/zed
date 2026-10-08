@@ -10894,6 +10894,83 @@ async fn test_reveal_in_file_manager_path_falls_back_to_worktree_root(
 }
 
 #[gpui::test]
+async fn test_project_view(cx: &mut gpui::TestAppContext) {
+    struct SourcesView;
+
+    impl ProjectView for SourcesView {
+        fn name(&self) -> SharedString {
+            "Sources".into()
+        }
+
+        fn contains(&self, _: WorktreeId, path: &RelPath, _: bool) -> bool {
+            path.starts_with(rel_path("src"))
+        }
+    }
+
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            "src": { "main.rs": "" },
+            "target": { "debug": {} },
+            "README.md": "",
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+    toggle_expand_dir(&panel, "root/src", cx);
+
+    let all_files = [
+        "v root",
+        "    v src  <== selected",
+        "          main.rs",
+        "    > target",
+        "      README.md",
+    ];
+    assert_eq!(visible_entries_as_strings(&panel, 0..10, cx), &all_files);
+
+    cx.update(|_, cx| set_project_view(&project, Some(Arc::new(SourcesView)), cx));
+    cx.run_until_parked();
+    assert_eq!(
+        visible_entries_as_strings(&panel, 0..10, cx),
+        &["v root", "    v src  <== selected", "          main.rs"],
+        "The project view should hide entries outside of it"
+    );
+
+    panel.update_in(cx, |panel, window, cx| {
+        panel.set_show_project_view(false, window, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        visible_entries_as_strings(&panel, 0..10, cx),
+        &all_files,
+        "Switching to all files should show every entry"
+    );
+
+    panel.update_in(cx, |panel, window, cx| {
+        panel.set_show_project_view(true, window, cx)
+    });
+    cx.update(|_, cx| set_project_view(&project, None, cx));
+    cx.run_until_parked();
+    assert_eq!(
+        visible_entries_as_strings(&panel, 0..10, cx),
+        &all_files,
+        "Without a project view, every entry should be shown"
+    );
+}
+
+#[gpui::test]
 async fn test_hide_hidden_entries(cx: &mut gpui::TestAppContext) {
     init_test(cx);
 

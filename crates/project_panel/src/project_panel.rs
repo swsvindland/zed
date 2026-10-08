@@ -5,6 +5,7 @@ mod utils;
 use anyhow::{Context as _, Result};
 use client::{ErrorCode, ErrorExt};
 use collections::{BTreeSet, HashMap, hash_map};
+use db::kvp::KeyValueStore;
 use editor::{
     Editor, EditorEvent, MultiBufferOffset,
     items::{
@@ -20,13 +21,14 @@ use git_ui_core::file_diff_view::FileDiffView;
 use gpui::{
     Action, Anchor, AnyElement, App, AsyncWindowContext, Bounds,
     ClipboardEntry as GpuiClipboardEntry, ClipboardItem, Context, CursorStyle, DismissEvent, Div,
-    DragMoveEvent, Entity, EventEmitter, ExternalDragPayload, ExternalPaths, FileDragPaths,
-    FileDropEvent, FocusHandle, Focusable, FontWeight, Hsla, InteractiveElement, KeyContext,
-    ListHorizontalSizingBehavior, ListSizingBehavior, Modifiers, ModifiersChangedEvent,
-    MouseButton, MouseDownEvent, MouseExitEvent, ParentElement, PathPromptOptions, Pixels, Point,
-    PromptLevel, Render, ScrollStrategy, Stateful, Styled, Subscription, Task,
-    UniformListScrollHandle, WeakEntity, Window, actions, anchored, deferred, div, hsla,
-    linear_color_stop, linear_gradient, point, px, size, transparent_white, uniform_list,
+    DragMoveEvent, Entity, EntityId, EventEmitter, ExternalDragPayload, ExternalPaths,
+    FileDragPaths, FileDropEvent, FocusHandle, Focusable, FontWeight, Global, Hsla,
+    InteractiveElement, KeyContext, ListHorizontalSizingBehavior, ListSizingBehavior, Modifiers,
+    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent, ParentElement,
+    PathPromptOptions, Pixels, Point, PromptLevel, Render, ScrollStrategy, Stateful, Styled,
+    Subscription, Task, UniformListScrollHandle, WeakEntity, Window, actions, anchored, deferred,
+    div, hsla, linear_color_stop, linear_gradient, point, px, size, transparent_white,
+    uniform_list,
 };
 use itertools::Itertools;
 use language::DiagnosticSeverity;
@@ -62,7 +64,8 @@ use theme_settings::ThemeSettings;
 use ui::{
     ContextMenu, DecoratedIcon, IconDecoration, IconDecorationKind, IndentGuideColors,
     IndentGuideLayout, Indicator, KeyBinding, ListItem, ListItemSpacing, ProjectEmptyState,
-    ScrollAxes, ScrollableHandle, Scrollbars, StickyCandidate, Tooltip, WithScrollbar, prelude::*,
+    ScrollAxes, ScrollableHandle, Scrollbars, StickyCandidate, ToggleButtonGroup,
+    ToggleButtonGroupStyle, ToggleButtonSimple, Tooltip, WithScrollbar, prelude::*,
 };
 use util::{
     ResultExt, TryFutureExt,
@@ -91,7 +94,41 @@ use crate::{
 };
 
 const PROJECT_PANEL_KEY: &str = "ProjectPanel";
+const SHOW_PROJECT_VIEW_KEY: &str = "project_panel_show_project_view";
 const NEW_ENTRY_ID: ProjectEntryId = ProjectEntryId::MAX;
+
+/// A narrower view of a project's files that the project panel can switch to, such as the
+/// solution view of a .NET IDE.
+pub trait ProjectView: Send + Sync {
+    /// The view's name in the project panel's view switcher.
+    fn name(&self) -> SharedString;
+
+    /// Whether the entry at `path` is part of the view. Directories leading to entries in the
+    /// view must be part of it as well.
+    fn contains(&self, worktree_id: WorktreeId, path: &RelPath, is_dir: bool) -> bool;
+}
+
+#[derive(Default)]
+struct ProjectViews(HashMap<EntityId, Arc<dyn ProjectView>>);
+
+impl Global for ProjectViews {}
+
+/// Sets the view that the project panel of `project` can switch to, replacing any previous one.
+pub fn set_project_view(
+    project: &Entity<Project>,
+    view: Option<Arc<dyn ProjectView>>,
+    cx: &mut App,
+) {
+    let views = &mut cx.default_global::<ProjectViews>().0;
+    match view {
+        Some(view) => {
+            views.insert(project.entity_id(), view);
+        }
+        None => {
+            views.remove(&project.entity_id());
+        }
+    }
+}
 
 struct VisibleEntriesForWorktree {
     worktree_id: WorktreeId,
@@ -165,6 +202,8 @@ pub struct ProjectPanel {
     last_reported_update: Instant,
     update_visible_entries_task: UpdateVisibleEntriesTask,
     undo_manager: UndoManager,
+    /// Whether to narrow the panel to the project's [`ProjectView`], when it has one.
+    show_project_view: bool,
     state: State,
 }
 
@@ -413,6 +452,9 @@ actions!(
         ToggleHideGitIgnore,
         /// Toggles visibility of hidden files.
         ToggleHideHidden,
+        /// Switches between the project's own view of its files, such as a .NET solution, and
+        /// all files.
+        ToggleProjectView,
         /// Starts a new search in the selected directory.
         NewSearchInDirectory,
         /// Unfolds the selected directory.
@@ -520,6 +562,14 @@ pub fn init(cx: &mut App) {
                         .unwrap_or(false),
                 );
             })
+        });
+
+        workspace.register_action(|workspace, _: &ToggleProjectView, window, cx| {
+            if let Some(panel) = workspace.panel::<ProjectPanel>(cx) {
+                panel.update(cx, |panel, cx| {
+                    panel.set_show_project_view(!panel.show_project_view, window, cx)
+                });
+            }
         });
 
         workspace.register_action(|workspace, _: &ToggleHideHidden, _, cx| {
@@ -847,6 +897,12 @@ impl ProjectPanel {
             })
             .detach();
 
+            cx.observe_global_in::<ProjectViews>(window, |this, window, cx| {
+                this.update_visible_entries(None, false, false, window, cx);
+                cx.notify();
+            })
+            .detach();
+
             let mut project_panel_settings = *ProjectPanelSettings::get_global(cx);
             cx.observe_global_in::<SettingsStore>(window, move |this, window, cx| {
                 let new_settings = *ProjectPanelSettings::get_global(cx);
@@ -913,6 +969,11 @@ impl ProjectPanel {
                     unfolded_dir_ids: Default::default(),
                 },
                 update_visible_entries_task: Default::default(),
+                show_project_view: KeyValueStore::global(cx)
+                    .read_kvp(SHOW_PROJECT_VIEW_KEY)
+                    .log_err()
+                    .flatten()
+                    .is_none_or(|show| show == "true"),
                 undo_manager: UndoManager::new(
                     workspace.weak_handle(),
                     weak_project_panel,
@@ -4543,6 +4604,28 @@ impl ProjectPanel {
         }
     }
 
+    fn project_view(&self, cx: &App) -> Option<Arc<dyn ProjectView>> {
+        cx.try_global::<ProjectViews>()?
+            .0
+            .get(&self.project.entity_id())
+            .cloned()
+    }
+
+    fn set_show_project_view(&mut self, show: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.show_project_view == show {
+            return;
+        }
+        self.show_project_view = show;
+        let store = KeyValueStore::global(cx);
+        db::write_and_log(cx, move || async move {
+            store
+                .write_kvp(SHOW_PROJECT_VIEW_KEY.into(), show.to_string())
+                .await
+        });
+        self.update_visible_entries(None, false, false, window, cx);
+        cx.notify();
+    }
+
     fn update_visible_entries(
         &mut self,
         new_selected_entry: Option<(WorktreeId, ProjectEntryId)>,
@@ -4576,6 +4659,10 @@ impl ProjectPanel {
             .collect();
         let hide_root = settings.hide_root && visible_worktrees.len() == 1;
         let hide_hidden = settings.hide_hidden;
+        let project_view = self
+            .show_project_view
+            .then(|| self.project_view(cx))
+            .flatten();
 
         let visible_entries_task = cx.spawn_in(window, async move |this, cx| {
             let new_state = cx
@@ -4672,9 +4759,13 @@ impl ProjectPanel {
                                 }
                             }
                             auto_folded_ancestors.clear();
-                            if (!hide_gitignore || !entry.is_ignored)
+                            let is_visible = (!hide_gitignore || !entry.is_ignored)
                                 && (!hide_hidden || !entry.is_hidden)
-                            {
+                                && project_view.as_ref().is_none_or(|view| {
+                                    entry.path.is_empty()
+                                        || view.contains(worktree_id, &entry.path, entry.is_dir())
+                                });
+                            if is_visible {
                                 visible_worktree_entries.push(entry.to_owned());
                             }
                             let precedes_new_entry = if let Some(new_entry_id) = new_entry_parent_id
@@ -4687,10 +4778,7 @@ impl ProjectPanel {
                             } else {
                                 false
                             };
-                            if precedes_new_entry
-                                && (!hide_gitignore || !entry.is_ignored)
-                                && (!hide_hidden || !entry.is_hidden)
-                            {
+                            if precedes_new_entry && is_visible {
                                 visible_worktree_entries.push(Self::create_new_git_entry(
                                     entry.entry,
                                     entry.git_summary,
@@ -7307,6 +7395,42 @@ impl ProjectPanel {
         None
     }
 
+    fn render_project_view_switcher(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let view = self.project_view(cx)?;
+        Some(
+            h_flex()
+                .flex_none()
+                .w_full()
+                .px_2()
+                .py_1()
+                .border_b_1()
+                .border_color(cx.theme().colors().border_variant)
+                .child(
+                    ToggleButtonGroup::single_row(
+                        "project-panel-view",
+                        [
+                            ToggleButtonSimple::new(
+                                view.name(),
+                                cx.listener(|this, _, window, cx| {
+                                    this.set_show_project_view(true, window, cx)
+                                }),
+                            ),
+                            ToggleButtonSimple::new(
+                                "Files",
+                                cx.listener(|this, _, window, cx| {
+                                    this.set_show_project_view(false, window, cx)
+                                }),
+                            ),
+                        ],
+                    )
+                    .style(ToggleButtonGroupStyle::Outlined)
+                    .label_size(LabelSize::Small)
+                    .selected_index(if self.show_project_view { 0 } else { 1 }),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_sticky_entries(
         &self,
         child: StickyProjectPanelCandidate,
@@ -7456,6 +7580,7 @@ impl Render for ProjectPanel {
         }
 
         let has_worktree = !self.state.visible_entries.is_empty();
+        let project_view_switcher = self.render_project_view_switcher(cx);
         let project = self.project.read(cx);
         let panel_settings = ProjectPanelSettings::get_global(cx);
         let indent_size = panel_settings.indent_size;
@@ -7651,6 +7776,7 @@ impl Render for ProjectPanel {
                 .track_focus(&self.focus_handle(cx))
                 .child(
                     v_flex()
+                        .when_some(project_view_switcher, |this, switcher| this.child(switcher))
                         .child(
                             uniform_list("entries", item_count, {
                                 cx.processor(|this, range: Range<usize>, window, cx| {

@@ -1,9 +1,11 @@
 mod msbuild;
 mod run_configuration_picker;
+mod solution_view;
 
 use std::{
     borrow::Cow,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -16,6 +18,7 @@ use gpui::{
     Subscription, Task, WeakEntity, Window, actions, div,
 };
 use project::{Project, TaskSourceKind};
+use project_panel::ProjectView;
 use task::{RevealStrategy, SaveStrategy, TaskContext, TaskTemplate};
 use ui::{
     Button, ButtonCommon, Clickable, IconButton, IconName, IconSize, LabelSize, Tooltip, h_flex,
@@ -35,6 +38,7 @@ use msbuild::{
 };
 pub use msbuild::{MsBuildProject, RunConfiguration, RunKind, Solution};
 use run_configuration_picker::RunConfigurationPicker;
+use solution_view::SolutionView;
 
 actions!(
     dotnet,
@@ -185,6 +189,8 @@ impl DotnetProjects {
             }
             _ => {}
         });
+        cx.on_release(|this, cx| project_panel::set_project_view(&this.project, None, cx))
+            .detach();
         let mut this = Self {
             project,
             solutions: Vec::new(),
@@ -249,7 +255,7 @@ impl DotnetProjects {
                 return;
             };
 
-            let (solutions, projects) = cx
+            let (solutions, projects, solution_view) = cx
                 .background_spawn(async move {
                     let paths = snapshots
                         .iter()
@@ -263,11 +269,22 @@ impl DotnetProjects {
                                 .map(|entry| snapshot.absolutize(&entry.path))
                         })
                         .collect::<Vec<_>>();
-                    load_project_model(fs.as_ref(), paths).await
+                    let (solutions, projects) = load_project_model(fs.as_ref(), paths).await;
+                    let worktrees = snapshots
+                        .iter()
+                        .map(|snapshot| (snapshot.id(), snapshot.abs_path().clone()))
+                        .collect::<Vec<_>>();
+                    let solution_view = SolutionView::new(&worktrees, &solutions, &projects);
+                    (solutions, projects, solution_view)
                 })
                 .await;
 
             this.update(cx, |this, cx| {
+                project_panel::set_project_view(
+                    &this.project,
+                    solution_view.map(|view| Arc::new(view) as Arc<dyn ProjectView>),
+                    cx,
+                );
                 this.set_project_model(solutions, projects, cx)
             })
             .log_err();
