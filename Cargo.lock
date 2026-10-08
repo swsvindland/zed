@@ -5160,6 +5160,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
+name = "dotnet"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "db",
+ "editor",
+ "fs",
+ "futures 0.3.34",
+ "fuzzy",
+ "gpui",
+ "indoc",
+ "log",
+ "menu",
+ "picker",
+ "pretty_assertions",
+ "project",
+ "quick-xml 0.41.0",
+ "serde",
+ "serde_json",
+ "serde_json_lenient",
+ "task",
+ "ui",
+ "url",
+ "util",
+ "which",
+ "workspace",
+]
+
+[[package]]
 name = "downcast-rs"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -22439,6 +22468,7 @@ dependencies = [
  "debugger_ui",
  "dev_container",
  "diagnostics",
+ "dotnet",
  "edit_prediction",
  "edit_prediction_ui",
  "editor",
