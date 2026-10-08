@@ -675,6 +675,21 @@ impl WorktreeStore {
                             && abs_old_path.to_str().map(|p| p.to_lowercase())
                                 == abs_new_path.to_str().map(|p| p.to_lowercase());
 
+                        // In Subversion working copies, move versioned files with `svn move`
+                        // so that the move is committed as one, rather than as a deletion
+                        // and an untracked file.
+                        if !overwrite && !fs.is_fake() {
+                            match git::svn::move_versioned_path(&abs_old_path, &abs_new_path)
+                                .await
+                            {
+                                Ok(true) => return Ok(()),
+                                Ok(false) => {}
+                                Err(error) => log::warn!(
+                                    "svn move of {abs_old_path:?} failed, renaming it without svn: {error:#}"
+                                ),
+                            }
+                        }
+
                         // The directory we're renaming into might not exist yet
                         if let Err(e) =
                             do_rename(fs.as_ref(), &abs_old_path, &abs_new_path, overwrite).await

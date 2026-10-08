@@ -25,7 +25,7 @@ use futures::{
 use futures_lite::future::yield_now;
 use fuzzy::CharBag;
 use git::{
-    BISECT_LOG, COMMIT_MESSAGE, DOT_GIT, FETCH_HEAD, FSMONITOR_DAEMON, GC_PID, GITIGNORE,
+    BISECT_LOG, COMMIT_MESSAGE, DOT_GIT, DOT_SVN, FETCH_HEAD, FSMONITOR_DAEMON, GC_PID, GITIGNORE,
     HOOKS_DIR, INFO_DIR, LFS_DIR, LOGS_DIR, LOGS_REF_STASH, OBJECTS_DIR, ORIG_HEAD,
     REBASE_APPLY_DIR, REBASE_MERGE_DIR, REFS_DIR, REFTABLE_DIR, REPO_EXCLUDE, SEQUENCER_DIR,
     status::GitSummary,
@@ -3114,7 +3114,11 @@ impl LocalSnapshot {
             let is_repo_root = fs
                 .metadata(&ancestor.join(DOT_GIT))
                 .await
-                .is_ok_and(|metadata| metadata.is_some());
+                .is_ok_and(|metadata| metadata.is_some())
+                || fs
+                    .metadata(&ancestor.join(DOT_SVN))
+                    .await
+                    .is_ok_and(|metadata| metadata.is_some_and(|metadata| metadata.is_dir));
             if is_repo_root {
                 if repo_root.is_none() {
                     repo_root = Some(Arc::from(ancestor));
@@ -3349,7 +3353,21 @@ impl BackgroundScannerState {
 
     async fn insert_entry(&mut self, entry: Entry, fs: &dyn Fs, watcher: &dyn Watcher) -> Entry {
         let entry = self.snapshot.insert_entry(entry, fs).await;
-        if entry.path.file_name() == Some(&DOT_GIT) {
+        // A directory that's both a git repository and a Subversion working copy is
+        // treated as a git repository.
+        let is_svn_working_copy = entry.path.file_name() == Some(&DOT_SVN)
+            && entry.is_dir()
+            && !matches!(
+                fs.metadata(
+                    &self
+                        .snapshot
+                        .absolutize(&entry.path)
+                        .with_file_name(DOT_GIT)
+                )
+                .await,
+                Ok(Some(_))
+            );
+        if entry.path.file_name() == Some(&DOT_GIT) || is_svn_working_copy {
             self.insert_git_repository(entry.path.clone(), fs, watcher)
                 .await;
         }
@@ -3566,7 +3584,7 @@ impl BackgroundScannerState {
                 // Guard against repositories inside the repository metadata
                 if parent_dir
                     .components()
-                    .any(|component| component == DOT_GIT)
+                    .any(|component| component == DOT_GIT || component == DOT_SVN)
                 {
                     log::debug!(
                         "not building git repository for nested `.git` directory, `.git` path in the worktree: {dot_git_path:?}"
@@ -3726,7 +3744,7 @@ async fn watch_dir_tree(root_abs_path: PathBuf, fs: &dyn Fs, watcher: &dyn Watch
 
 async fn is_dot_git(path: &Path, fs: &dyn Fs) -> bool {
     if let Some(file_name) = path.file_name()
-        && file_name == DOT_GIT
+        && (file_name == DOT_GIT || file_name == DOT_SVN)
     {
         return true;
     }
@@ -4931,22 +4949,29 @@ impl BackgroundScanner {
                 }
 
                 if let Some((dot_git_abs_path, path_in_git_dir)) = dot_git_paths {
-                    let is_ignored = skipped_file_names_in_dot_git.iter().any(|skipped| {
-                        path_in_git_dir
-                            .file_name()
-                            .is_some_and(|file_name| file_name == OsStr::new(skipped))
-                    }) || (path_in_git_dir.starts_with(LOGS_DIR)
-                        && path_in_git_dir != Path::new(LOGS_REF_STASH))
-                        || (path_in_git_dir.starts_with(INFO_DIR)
-                            && path_in_git_dir != Path::new(REPO_EXCLUDE))
-                        || skipped_dirs_in_dot_git.iter().any(|skipped_git_subdir| {
-                            path_in_git_dir.starts_with(skipped_git_subdir)
-                        })
-                        || path_in_git_dir.extension().is_some_and(|ext| ext == "lock")
-                        || (path_in_git_dir.components().count() == 1
-                            && path_in_git_dir
-                                .extension()
-                                .is_some_and(|ext| ext == "new" || ext == "tmp"));
+                    // Every Subversion operation that changes the working copy's state
+                    // writes `wc.db`; everything else in `.svn` is scratch space.
+                    let is_ignored = if git::svn::is_svn_admin_dir(&dot_git_abs_path) {
+                        path_in_git_dir != Path::new("")
+                            && path_in_git_dir != Path::new(git::svn::WC_DB)
+                    } else {
+                        skipped_file_names_in_dot_git.iter().any(|skipped| {
+                            path_in_git_dir
+                                .file_name()
+                                .is_some_and(|file_name| file_name == OsStr::new(skipped))
+                        }) || (path_in_git_dir.starts_with(LOGS_DIR)
+                            && path_in_git_dir != Path::new(LOGS_REF_STASH))
+                            || (path_in_git_dir.starts_with(INFO_DIR)
+                                && path_in_git_dir != Path::new(REPO_EXCLUDE))
+                            || skipped_dirs_in_dot_git.iter().any(|skipped_git_subdir| {
+                                path_in_git_dir.starts_with(skipped_git_subdir)
+                            })
+                            || path_in_git_dir.extension().is_some_and(|ext| ext == "lock")
+                            || (path_in_git_dir.components().count() == 1
+                                && path_in_git_dir
+                                    .extension()
+                                    .is_some_and(|ext| ext == "new" || ext == "tmp"))
+                    };
                     let is_dot_git = path_in_git_dir == Path::new("")
                         && matches!(event.kind, Some(PathEventKind::Changed))
                         && self.fs.is_dir(&dot_git_abs_path).await;
@@ -5452,12 +5477,18 @@ impl BackgroundScanner {
             .collect::<Vec<_>>()
             .await;
 
-        // Ensure that .git and .gitignore are processed first.
+        // Ensure that .git, .svn and .gitignore are processed first.
         swap_to_front(&mut child_paths, GITIGNORE);
+        swap_to_front(&mut child_paths, DOT_SVN);
         swap_to_front(&mut child_paths, DOT_GIT);
 
-        if let Some(path) = child_paths.first()
-            && path.ends_with(DOT_GIT)
+        let has_dot_git = child_paths
+            .first()
+            .is_some_and(|path| path.ends_with(DOT_GIT));
+        if child_paths
+            .iter()
+            .take(2)
+            .any(|path| path.ends_with(DOT_GIT) || path.ends_with(DOT_SVN))
         {
             ignore_stack.repo_root = Some(job.abs_path.clone());
             ignore_stack.global_ignore_root = Some(job.abs_path.clone());
@@ -5475,7 +5506,12 @@ impl BackgroundScanner {
             let child_path: Arc<RelPath> = child_path.into();
 
             if self.track_git_repositories {
-                if child_name == DOT_GIT {
+                // A directory with both `.git` and `.svn` is treated as a git repository.
+                if child_name == DOT_GIT
+                    || (child_name == DOT_SVN
+                        && !has_dot_git
+                        && self.fs.is_dir(&child_abs_path).await)
+                {
                     let mut state = self.state.lock().await;
                     state
                         .insert_git_repository(
@@ -5857,7 +5893,9 @@ impl BackgroundScanner {
     }
 
     fn remove_repo_path(&self, path: Arc<RelPath>, snapshot: &mut LocalSnapshot) -> Option<()> {
-        if !path.components().any(|component| component == DOT_GIT)
+        if !path
+            .components()
+            .any(|component| component == DOT_GIT || component == DOT_SVN)
             && let Some(local_repo) = snapshot.local_repo_for_work_directory_path(&path)
         {
             let id = local_repo.work_directory_id;
@@ -6063,7 +6101,11 @@ impl BackgroundScanner {
             return;
         };
 
-        if let Ok(Some(_)) = self.fs.metadata(&job.abs_path.join(DOT_GIT)).await {
+        if matches!(
+            self.fs.metadata(&job.abs_path.join(DOT_GIT)).await,
+            Ok(Some(_))
+        ) || self.fs.is_dir(&job.abs_path.join(DOT_SVN)).await
+        {
             ignore_stack.repo_root = Some(job.abs_path.clone());
             ignore_stack.global_ignore_root = Some(job.abs_path.clone());
         }
@@ -6353,15 +6395,20 @@ async fn discover_ancestor_git_repo(
             }
         }
 
-        let ancestor_dot_git = ancestor.join(DOT_GIT);
+        let mut ancestor_dot_git = ancestor.join(DOT_GIT);
         log::trace!("considering ancestor: {ancestor_dot_git:?}");
         // Check whether the directory or file called `.git` exists (in the
-        // case of worktrees it's a file.)
-        if fs
+        // case of worktrees it's a file), or failing that, a Subversion
+        // working copy's `.svn` directory.
+        let mut is_repository_root = fs
             .metadata(&ancestor_dot_git)
             .await
-            .is_ok_and(|metadata| metadata.is_some())
-        {
+            .is_ok_and(|metadata| metadata.is_some());
+        if !is_repository_root && fs.is_dir(&ancestor.join(DOT_SVN)).await {
+            ancestor_dot_git = ancestor.join(DOT_SVN);
+            is_repository_root = true;
+        }
+        if is_repository_root {
             let dot_git_abs_path = if index != 0 {
                 // We canonicalize, since the FS events use the canonicalized path.
                 match fs.canonicalize(&ancestor_dot_git).await.log_err() {
