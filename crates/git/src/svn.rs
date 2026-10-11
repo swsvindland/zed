@@ -30,7 +30,7 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use askpass::IKnowWhatIAmDoingAndIHaveReadTheDocs;
 use async_channel::Sender;
 use collections::{HashMap, HashSet};
-use futures::future::{BoxFuture, Either};
+use futures::future::{BoxFuture, Either, Shared};
 use futures::{AsyncWriteExt as _, FutureExt as _};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use gpui::{AppContext as _, AsyncApp, BackgroundExecutor, SharedString, Task};
@@ -170,6 +170,25 @@ struct SvnState {
     /// was loaded.
     parents: HashMap<u64, u64>,
     requested_messages: HashSet<u64>,
+    /// The blame of each file's `BASE` text, by path. Blaming needs the server, but `BASE`
+    /// only changes when the working copy is updated or committed, so blaming local edits
+    /// reuses it. An unfinished blame is shared too, so that a slow server doesn't keep
+    /// restarting it every time the buffer is edited.
+    base_blames: HashMap<String, (BaseBlameKey, SharedBaseBlame)>,
+}
+
+type SharedBaseBlame = Shared<Task<Result<Arc<BaseBlame>, Arc<anyhow::Error>>>>;
+
+/// Identifies a file's `BASE` text, whose blame can't change while this stays the same.
+#[derive(Clone, Debug, PartialEq)]
+struct BaseBlameKey {
+    url: String,
+    last_changed_revision: Option<u64>,
+}
+
+struct BaseBlame {
+    text: String,
+    lines: Vec<BlameLine>,
 }
 
 impl SvnState {
@@ -512,9 +531,11 @@ impl GitRepository for SvnRepository {
             if content == worktree_content {
                 return self.stage_paths(vec![path], env).await;
             }
+            // The index text is always the base text, so this leaves it unchanged. Restoring a
+            // hunk does this, and it mustn't take the file out of the next commit.
             let base_content = base_text(&self.svn, path.as_unix_str()).await?;
             if content == base_content {
-                return self.unstage_paths(vec![path], env).await;
+                return Ok(());
             }
             Err(anyhow!(WHOLE_FILES_ONLY))
         }
@@ -889,26 +910,17 @@ impl GitRepository for SvnRepository {
     ) -> BoxFuture<'_, Result<Blame>> {
         let svn = self.svn.clone();
         let state = self.state.clone();
+        let executor = self.executor.clone();
         self.executor
             .spawn(async move {
                 let current_text =
                     text::chunks_with_line_ending(&content, line_ending).collect::<String>();
-                let base = base_text(&svn, path.as_unix_str())
-                    .await?
-                    .context("file is not under version control")?;
-                let base_text = String::from_utf8_lossy(&base).into_owned();
-                let blame_output = svn
-                    .run_with_args(
-                        [OsString::from("blame"), "--xml".into(), "--".into()],
-                        [path_target(path.as_unix_str())],
-                    )
-                    .await?;
-                let blame_lines = parse_blame(&blame_output)?;
-                let messages = load_messages(&svn, &state, path.as_unix_str(), &blame_lines).await;
+                let base_blame = base_blame(&svn, &state, &executor, path.as_unix_str()).await?;
+                let messages = cached_messages(&state, &base_blame.lines);
                 Ok(build_blame(
                     &path,
-                    &blame_lines,
-                    &base_text,
+                    &base_blame.lines,
+                    &base_blame.text,
                     &current_text,
                     messages,
                 ))
@@ -934,7 +946,8 @@ impl GitRepository for SvnRepository {
                 let blame_lines = parse_blame(&blame_output)?;
                 let text = text_at_revision(&svn, path.as_unix_str(), revision).await?;
                 let text = String::from_utf8_lossy(&text).into_owned();
-                let messages = load_messages(&svn, &state, &target, &blame_lines).await;
+                load_missing_messages(&svn, &state, &target, &blame_lines).await;
+                let messages = cached_messages(&state, &blame_lines);
                 Ok(build_blame(&path, &blame_lines, &text, &text, messages))
             })
             .boxed()
@@ -1742,18 +1755,104 @@ async fn excluded_paths(svn: &SvnBinary) -> Result<HashSet<String>> {
         .collect())
 }
 
-async fn load_messages(
+/// Blames the `BASE` text of `path`, reusing the last blame of it until its `BASE` changes.
+async fn base_blame(
+    svn: &SvnBinary,
+    state: &Arc<Mutex<SvnState>>,
+    executor: &BackgroundExecutor,
+    path: &str,
+) -> Result<Arc<BaseBlame>> {
+    let info = svn
+        .output_with_args(
+            [OsString::from("info"), "--xml".into(), "--".into()],
+            [path_target(path)],
+        )
+        .await?;
+    if !info.status.success() {
+        bail!("file is not under version control");
+    }
+    let info = parse_info(&String::from_utf8_lossy(&info.stdout))?;
+    let key = BaseBlameKey {
+        url: info.url,
+        last_changed_revision: info.last_changed.map(|commit| commit.revision),
+    };
+
+    let blame = {
+        let mut state_guard = state.lock();
+        match state_guard.base_blames.get(path) {
+            Some((cached_key, blame)) if *cached_key == key => blame.clone(),
+            _ => {
+                let blame = executor
+                    .spawn({
+                        let svn = svn.clone();
+                        let state = state.clone();
+                        let path = path.to_string();
+                        async move {
+                            load_base_blame(&svn, &state, &path)
+                                .await
+                                .map(Arc::new)
+                                .map_err(Arc::new)
+                        }
+                    })
+                    .shared();
+                state_guard
+                    .base_blames
+                    .insert(path.to_string(), (key, blame.clone()));
+                blame
+            }
+        }
+    };
+
+    let result = blame.clone().await;
+    if result.is_err() {
+        // Don't keep the failure around, so that the next blame asks the server again.
+        let mut state = state.lock();
+        if state
+            .base_blames
+            .get(path)
+            .is_some_and(|(_, cached)| cached.ptr_eq(&blame))
+        {
+            state.base_blames.remove(path);
+        }
+    }
+    result.map_err(|error| anyhow!("{error:#}"))
+}
+
+async fn load_base_blame(
+    svn: &SvnBinary,
+    state: &Mutex<SvnState>,
+    path: &str,
+) -> Result<BaseBlame> {
+    let base = base_text(svn, path)
+        .await?
+        .context("file is not under version control")?;
+    let blame_output = svn
+        .run_with_args(
+            [OsString::from("blame"), "--xml".into(), "--".into()],
+            [path_target(path)],
+        )
+        .await?;
+    let lines = parse_blame(&blame_output)?;
+    load_missing_messages(svn, state, path, &lines).await;
+    Ok(BaseBlame {
+        text: String::from_utf8_lossy(&base).into_owned(),
+        lines,
+    })
+}
+
+/// Loads the messages of the commits in `blame_lines` that haven't been loaded yet.
+async fn load_missing_messages(
     svn: &SvnBinary,
     state: &Mutex<SvnState>,
     target: &str,
     blame_lines: &[BlameLine],
-) -> HashMap<u64, String> {
+) {
     let revisions = blame_lines
         .iter()
         .filter_map(|line| line.revision)
         .collect::<BTreeSet<_>>();
     let (Some(first), Some(last)) = (revisions.first(), revisions.last()) else {
-        return HashMap::default();
+        return;
     };
     let missing = {
         let state = state.lock();
@@ -1761,24 +1860,31 @@ async fn load_messages(
             .iter()
             .any(|revision| !state.commits.contains_key(revision))
     };
-    if missing {
-        let range = format!("{first}:{last}");
-        let target = if target.contains('@') {
-            target.to_string()
-        } else {
-            format!("{target}@")
-        };
-        if let Some(commits) = svn
-            .run(["log", "--xml", "-r", range.as_str(), "--", target.as_str()])
-            .await
-            .and_then(|log| parse_log(&log))
-            .log_err()
-        {
-            state.lock().insert_commits(commits);
-        }
+    if !missing {
+        return;
     }
+    let range = format!("{first}:{last}");
+    let target = if target.contains('@') {
+        target.to_string()
+    } else {
+        format!("{target}@")
+    };
+    if let Some(commits) = svn
+        .run(["log", "--xml", "-r", range.as_str(), "--", target.as_str()])
+        .await
+        .and_then(|log| parse_log(&log))
+        .log_err()
+    {
+        state.lock().insert_commits(commits);
+    }
+}
+
+fn cached_messages(state: &Mutex<SvnState>, blame_lines: &[BlameLine]) -> HashMap<u64, String> {
     let state = state.lock();
-    revisions
+    blame_lines
+        .iter()
+        .filter_map(|line| line.revision)
+        .collect::<BTreeSet<_>>()
         .into_iter()
         .filter_map(|revision| Some((revision, state.commits.get(&revision)?.message.clone())))
         .collect()
@@ -2878,9 +2984,14 @@ Cannot display: file marked as a binary type.
     fn create_working_copy(root: &Path, files: &[(&str, &str)]) -> (String, PathBuf) {
         let repository = root.join("repository");
         run(root, "svnadmin", &["create", repository.to_str().unwrap()]);
+        // Windows paths start with a drive letter, which needs a leading slash in a URL.
         let url = format!(
-            "file://{}/trunk",
-            repository.to_str().unwrap().replace('\\', "/")
+            "file:///{}/trunk",
+            repository
+                .to_str()
+                .unwrap()
+                .replace('\\', "/")
+                .trim_start_matches('/')
         );
         run(root, "svn", &["mkdir", "-q", "-m", "Create trunk", &url]);
         let working_copy = root.join("working-copy");
@@ -3045,6 +3156,22 @@ Cannot display: file marked as a binary type.
                 .contains(&("a.txt".to_string(), 1, 0))
         );
 
+        // Setting the index text to the base text, which restoring a hunk does, leaves the
+        // file staged.
+        repository
+            .set_index_text(
+                repo_path("a.txt"),
+                Some(b"one\ntwo\n".to_vec()),
+                env.clone(),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            statuses(&repository, &[repo_path("a.txt")]).await,
+            [("a.txt".to_string(), staged(StatusCode::Modified))]
+        );
+
         repository
             .commit(
                 "Commit – with unicode".into(),
@@ -3196,6 +3323,78 @@ Cannot display: file marked as a binary type.
                 ("r3".to_string(), 1..2, Some("Shout two".to_string())),
                 (Oid::zero().display_short(), 2..3, None),
                 ("r2".to_string(), 3..4, Some("Initial commit".to_string())),
+            ]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_blame_reuses_base_blame(cx: &mut TestAppContext) {
+        if !svn_available() {
+            return;
+        }
+        cx.executor().allow_parking();
+        let root = tempfile::tempdir().unwrap();
+        let (_, working_copy) = create_working_copy(root.path(), &[("a.txt", "one\ntwo\n")]);
+        write_file(&working_copy, "a.txt", "one\nTWO\n");
+        run(&working_copy, "svn", &["commit", "-q", "-m", "Shout two"]);
+        run(&working_copy, "svn", &["update", "-q"]);
+        let repository = open(&working_copy, cx);
+        let blame = |content: &str| {
+            let blame = repository.blame(repo_path("a.txt"), Rope::from(content), LineEnding::Unix);
+            async move {
+                blame.await.map(|blame| {
+                    blame
+                        .entries
+                        .iter()
+                        .map(|entry| {
+                            (
+                                entry.sha.display_short(),
+                                entry.range.clone(),
+                                entry.summary.clone(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+            }
+        };
+        let server = root.path().join("repository");
+        let unreachable_server = root.path().join("unreachable");
+        let initial = || Some("Initial commit".to_string());
+        let shout = || Some("Shout two".to_string());
+
+        // A failed blame isn't kept around.
+        fs::rename(&server, &unreachable_server).unwrap();
+        assert!(blame("one\nTWO\n").await.is_err());
+        fs::rename(&unreachable_server, &server).unwrap();
+        assert_eq!(
+            blame("one\nTWO\n").await.unwrap(),
+            [
+                ("r2".to_string(), 0..1, initial()),
+                ("r3".to_string(), 1..2, shout()),
+            ]
+        );
+
+        // Local edits are blamed without asking the server again.
+        fs::rename(&server, &unreachable_server).unwrap();
+        assert_eq!(
+            blame("zero\none\nTWO\n").await.unwrap(),
+            [
+                (Oid::zero().display_short(), 0..1, None),
+                ("r2".to_string(), 1..2, initial()),
+                ("r3".to_string(), 2..3, shout()),
+            ]
+        );
+        fs::rename(&unreachable_server, &server).unwrap();
+
+        // Committing changes the base text, so it's blamed again.
+        write_file(&working_copy, "a.txt", "zero\none\nTWO\n");
+        run(&working_copy, "svn", &["commit", "-q", "-m", "Add zero"]);
+        assert_eq!(
+            blame("zero\none\nTWO\n").await.unwrap(),
+            [
+                ("r4".to_string(), 0..1, Some("Add zero".to_string())),
+                ("r2".to_string(), 1..2, initial()),
+                ("r3".to_string(), 2..3, shout()),
             ]
         );
     }

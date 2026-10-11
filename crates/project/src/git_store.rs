@@ -326,15 +326,18 @@ enum DiffKind {
 struct GitDiffOperations {
     project: WeakEntity<Project>,
     kind: DiffKind,
+    /// Subversion commits whole files, so its hunks can be restored but not staged.
+    supports_hunk_staging: bool,
 }
 
 impl DiffOperations for GitDiffOperations {
     fn supports_staging(&self) -> bool {
-        matches!(self.kind, DiffKind::Unstaged | DiffKind::Uncommitted)
+        self.supports_hunk_staging
+            && matches!(self.kind, DiffKind::Unstaged | DiffKind::Uncommitted)
     }
 
     fn supports_unstaging(&self) -> bool {
-        matches!(self.kind, DiffKind::Staged | DiffKind::Uncommitted)
+        self.supports_hunk_staging && matches!(self.kind, DiffKind::Staged | DiffKind::Uncommitted)
     }
 
     fn supports_restore(&self) -> bool {
@@ -1902,6 +1905,9 @@ impl GitStore {
 
             let git_store = cx.weak_entity();
             let project = this.project.clone();
+            let supports_hunk_staging = this
+                .repository_and_path_for_buffer_id(buffer_id, cx)
+                .is_none_or(|(repository, _)| !repository.read(cx).is_svn());
             let diff_state = this
                 .diffs
                 .entry(buffer_id)
@@ -1927,7 +1933,11 @@ impl GitStore {
                                 cx,
                             );
                             if let Some(project) = project.clone() {
-                                diff.set_operations(Arc::new(GitDiffOperations { project, kind }));
+                                diff.set_operations(Arc::new(GitDiffOperations {
+                                    project,
+                                    kind,
+                                    supports_hunk_staging,
+                                }));
                             }
                             diff
                         })
@@ -1958,7 +1968,11 @@ impl GitStore {
                                 cx,
                             );
                             if let Some(project) = project.clone() {
-                                diff.set_operations(Arc::new(GitDiffOperations { project, kind }));
+                                diff.set_operations(Arc::new(GitDiffOperations {
+                                    project,
+                                    kind,
+                                    supports_hunk_staging,
+                                }));
                             }
                             diff
                         })
@@ -1974,7 +1988,11 @@ impl GitStore {
                                 cx,
                             );
                             if let Some(project) = project.clone() {
-                                diff.set_operations(Arc::new(GitDiffOperations { project, kind }));
+                                diff.set_operations(Arc::new(GitDiffOperations {
+                                    project,
+                                    kind,
+                                    supports_hunk_staging,
+                                }));
                             }
                             diff
                         })
@@ -2020,6 +2038,7 @@ impl GitStore {
                                     diff.set_operations(Arc::new(GitDiffOperations {
                                         project,
                                         kind: DiffKind::Unstaged,
+                                        supports_hunk_staging,
                                     }));
                                 }
                                 diff

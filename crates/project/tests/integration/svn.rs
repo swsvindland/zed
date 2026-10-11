@@ -49,7 +49,15 @@ fn write_file(root: &Path, path: &str, contents: &str) {
 fn create_working_copy(root: &Path, files: &[(&str, &str)]) -> PathBuf {
     let repository = root.join("repository");
     run(root, "svnadmin", &["create", repository.to_str().unwrap()]);
-    let url = format!("file://{}/trunk", repository.to_str().unwrap());
+    // Windows paths start with a drive letter, which needs a leading slash in a URL.
+    let url = format!(
+        "file:///{}/trunk",
+        repository
+            .to_str()
+            .unwrap()
+            .replace('\\', "/")
+            .trim_start_matches('/')
+    );
     run(root, "svn", &["mkdir", "-q", "-m", "Create trunk", &url]);
     let working_copy = root.join("working-copy");
     run(
@@ -68,7 +76,8 @@ fn create_working_copy(root: &Path, files: &[(&str, &str)]) -> PathBuf {
     );
     run(&working_copy, "svn", &["update", "-q"]);
     // Canonicalize, since temporary directories are behind a symlink on macOS.
-    std::fs::canonicalize(working_copy).unwrap()
+    // Windows canonicalizes to a `\\?\` path, which the project doesn't use.
+    util::paths::SanitizedPath::new(&std::fs::canonicalize(working_copy).unwrap()).to_path_buf()
 }
 
 fn staged(code: StatusCode) -> FileStatus {
@@ -229,11 +238,13 @@ async fn test_svn_working_copy(cx: &mut TestAppContext) {
         cx,
     )
     .await;
+    // Windows prints paths with backslashes.
     let changelist = run(
         &working_copy,
         "svn",
         &["status", "--changelist", "ignore-on-commit"],
-    );
+    )
+    .replace('\\', "/");
     assert!(changelist.contains("src/main.rs"), "{changelist}");
 
     let askpass = AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {});
@@ -344,8 +355,121 @@ async fn test_svn_working_copy(cx: &mut TestAppContext) {
         cx,
     )
     .await;
-    let status = run(&working_copy, "svn", &["status"]);
+    let status = run(&working_copy, "svn", &["status"]).replace('\\', "/");
     assert!(status.contains("A  +    docs/README.md"), "{status}");
+}
+
+#[gpui::test]
+async fn test_svn_restore_hunk(cx: &mut TestAppContext) {
+    if !svn_available() {
+        return;
+    }
+    init_test(cx);
+    cx.executor().allow_parking();
+    let root = tempfile::tempdir().unwrap();
+    let working_copy =
+        create_working_copy(root.path(), &[("a.txt", "one\ntwo\nthree\nfour\nfive\n")]);
+    write_file(&working_copy, "a.txt", "ONE\ntwo\nthree\nfour\nFIVE\n");
+
+    let (project, repository) = open_project(&working_copy, cx).await;
+    wait_for_statuses(&repository, &[("a.txt", staged(StatusCode::Modified))], cx).await;
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(working_copy.join("a.txt"), cx)
+        })
+        .await
+        .unwrap();
+    let diff = project
+        .update(cx, |project, cx| {
+            project.open_uncommitted_diff(buffer.clone(), cx)
+        })
+        .await
+        .unwrap();
+    cx.executor().run_until_parked();
+
+    // Subversion commits whole files, so hunks can be restored but not staged.
+    diff.read_with(cx, |diff, _| {
+        let operations = diff.operations().unwrap();
+        assert!(operations.supports_restore());
+        assert!(!operations.supports_staging());
+        assert!(!operations.supports_unstaging());
+    });
+
+    let hunk_texts = |cx: &TestAppContext| {
+        diff.read_with(cx, |diff, cx| {
+            let buffer = buffer.read(cx).snapshot();
+            let diff = diff.snapshot(cx);
+            diff.hunks(&buffer)
+                .map(|hunk| {
+                    (
+                        hunk.buffer_range.clone(),
+                        diff.base_text()
+                            .as_rope()
+                            .slice(hunk.diff_base_byte_range)
+                            .to_string(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+    let hunks = hunk_texts(cx);
+    assert_eq!(hunks.len(), 2);
+    let (hunk_range, base_text) = hunks[0].clone();
+    assert_eq!(base_text, "one\n");
+
+    // Restoring a hunk reverts it in the buffer, like the editor does, and leaves the file
+    // in the next commit.
+    buffer.update(cx, |buffer, cx| {
+        buffer.edit([(hunk_range, base_text)], None, cx);
+    });
+    project
+        .update(cx, |project, cx| project.save_buffer(buffer.clone(), cx))
+        .await
+        .unwrap();
+    repository
+        .update(cx, |repository, _| repository.barrier())
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(working_copy.join("a.txt")).unwrap(),
+        "one\ntwo\nthree\nfour\nFIVE\n"
+    );
+    let changelist = run(
+        &working_copy,
+        "svn",
+        &["status", "--changelist", "ignore-on-commit"],
+    );
+    assert!(changelist.trim().is_empty(), "{changelist}");
+    wait_for_statuses(&repository, &[("a.txt", staged(StatusCode::Modified))], cx).await;
+
+    for _ in 0..200 {
+        cx.executor().run_until_parked();
+        if hunk_texts(cx).len() == 1 {
+            break;
+        }
+        cx.background_executor
+            .timer(Duration::from_millis(50))
+            .await;
+    }
+    assert_eq!(hunk_texts(cx).len(), 1);
+
+    let blame = project
+        .update(cx, |project, cx| project.blame_buffer(&buffer, None, cx))
+        .await
+        .unwrap()
+        .unwrap();
+    let entries = blame
+        .entries
+        .iter()
+        .map(|entry| (entry.sha.display_short(), entry.range.clone()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        entries,
+        [
+            ("r2".to_string(), 0..4),
+            (Oid::zero().display_short(), 4..5)
+        ]
+    );
 }
 
 #[gpui::test]
