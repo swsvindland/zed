@@ -24,6 +24,29 @@ use util::ResultExt as _;
 
 pub(crate) const RESIZE_HANDLE_SIZE: Pixels = px(6.);
 
+/// Space around each island (dock or center pane group), so adjacent islands are separated by
+/// twice this amount.
+pub(crate) const ISLAND_MARGIN: Pixels = px(4.);
+const ISLAND_CORNER_RADIUS: Pixels = px(8.);
+
+/// Rounds the corners of an island by painting over them in the window background color.
+///
+/// Content masks in GPUI are rectangular, so island contents (tab bars, panel backgrounds) would
+/// paint over a rounded background. Instead, this ring extends `ISLAND_MARGIN` past the island and
+/// shares its arc centers, so its inner edge traces the rounded island outline and its body covers
+/// the square corners. That requires `ISLAND_MARGIN > (sqrt(2) - 1) * ISLAND_CORNER_RADIUS`.
+pub(crate) fn island_corner_mask(cx: &App) -> Div {
+    div()
+        .absolute()
+        .top(-ISLAND_MARGIN)
+        .left(-ISLAND_MARGIN)
+        .right(-ISLAND_MARGIN)
+        .bottom(-ISLAND_MARGIN)
+        .rounded(ISLAND_CORNER_RADIUS + ISLAND_MARGIN)
+        .border(ISLAND_MARGIN)
+        .border_color(cx.theme().colors().background)
+}
+
 pub enum PanelEvent {
     ZoomIn,
     ZoomOut,
@@ -1300,11 +1323,13 @@ impl Render for Dock {
                         }),
                     )
                     .occlude();
+                // Center the handle in the gap between this island and its neighbor.
+                let handle_offset = -RESIZE_HANDLE_SIZE / 2. - ISLAND_MARGIN;
                 match self.position() {
                     DockPosition::Left => deferred(
                         handle
                             .absolute()
-                            .right(-RESIZE_HANDLE_SIZE / 2.)
+                            .right(handle_offset)
                             .top(px(0.))
                             .h_full()
                             .w(RESIZE_HANDLE_SIZE)
@@ -1313,7 +1338,7 @@ impl Render for Dock {
                     DockPosition::Bottom => deferred(
                         handle
                             .absolute()
-                            .top(-RESIZE_HANDLE_SIZE / 2.)
+                            .top(handle_offset)
                             .left(px(0.))
                             .w_full()
                             .h(RESIZE_HANDLE_SIZE)
@@ -1323,7 +1348,7 @@ impl Render for Dock {
                         handle
                             .absolute()
                             .top(px(0.))
-                            .left(-RESIZE_HANDLE_SIZE / 2.)
+                            .left(handle_offset)
                             .h_full()
                             .w(RESIZE_HANDLE_SIZE)
                             .cursor_col_resize(),
@@ -1336,20 +1361,15 @@ impl Render for Dock {
                 .key_context(dispatch_context)
                 .track_focus(&self.focus_handle(cx))
                 .focus_follows_mouse(self.focus_follows_mouse, cx)
+                .relative()
                 .flex()
                 .bg(cx.theme().colors().panel_background)
-                .border_color(cx.theme().colors().border)
                 .overflow_hidden()
                 .map(|this| match self.position().axis() {
                     // Width and height are always set on the workspace wrapper in
                     // render_dock, so fill whatever space the wrapper provides.
                     Axis::Horizontal => this.w_full().h_full().flex_row(),
                     Axis::Vertical => this.h_full().w_full().flex_col(),
-                })
-                .map(|this| match self.position() {
-                    DockPosition::Left => this.border_r_1(),
-                    DockPosition::Right => this.border_l_1(),
-                    DockPosition::Bottom => this.border_t_1(),
                 })
                 .child(
                     div()
@@ -1364,6 +1384,7 @@ impl Render for Dock {
                                 .cached(StyleRefinement::default().v_flex().size_full()),
                         ),
                 )
+                .child(island_corner_mask(cx))
                 .when(self.resizable(cx), |this| {
                     this.child(create_resize_handle())
                 })

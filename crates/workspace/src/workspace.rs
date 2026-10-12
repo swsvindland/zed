@@ -8694,6 +8694,7 @@ impl Workspace {
         // this, toggle_panel_focus cannot focus the panel when the dock is closed.
         let dock = dock.read(cx);
         if let Some(panel) = dock.visible_panel() {
+            container = container.p(dock::ISLAND_MARGIN);
             let size_state = dock.stored_panel_size_state(panel.as_ref());
             let min_size = panel.min_size(window, cx);
             if position.axis() == Axis::Horizontal {
@@ -8893,13 +8894,21 @@ impl Workspace {
                 this.track_focus(&self.region_focus_handles.editor)
             })
             .size_full()
-            .child(self.center.render(
-                self.zoomed.as_ref(),
-                self.maximized_pane.as_ref(),
-                render_cx,
-                window,
-                cx,
-            ))
+            .p(dock::ISLAND_MARGIN)
+            .child(
+                div()
+                    .relative()
+                    .size_full()
+                    .overflow_hidden()
+                    .child(self.center.render(
+                        self.zoomed.as_ref(),
+                        self.maximized_pane.as_ref(),
+                        render_cx,
+                        window,
+                        cx,
+                    ))
+                    .child(dock::island_corner_mask(cx)),
+            )
     }
 
     pub fn for_window(window: &Window, cx: &App) -> Option<Entity<Workspace>> {
@@ -9684,9 +9693,7 @@ impl Render for Workspace {
                             .flex()
                             .flex_col()
                             .overflow_hidden()
-                            .border_t_1()
-                            .border_b_1()
-                            .border_color(colors.border)
+                            .p(dock::ISLAND_MARGIN)
                             .child({
                                 let this = cx.entity();
                                 canvas(
