@@ -5971,6 +5971,7 @@ mod tests {
                 "skill_creator",
                 "snippets",
                 "stash_picker",
+                "supermaven",
                 "svg",
                 "syntax_tree_view",
                 "tab_switcher",

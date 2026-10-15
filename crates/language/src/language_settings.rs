@@ -494,7 +494,8 @@ impl InlayHintSettings {
     }
 }
 
-/// The settings for edit predictions, such as [GitHub Copilot](https://github.com/features/copilot).
+/// The settings for edit predictions, such as [GitHub Copilot](https://github.com/features/copilot)
+/// or [Supermaven](https://supermaven.com).
 #[derive(Clone, Debug, Default)]
 pub struct EditPredictionSettings {
     /// The provider that supplies edit predictions.
@@ -571,7 +572,8 @@ impl EditPredictionSettings {
                 .map_or_else(DelayMs::default, |settings| settings.prediction_debounce),
             settings::EditPredictionProvider::Zed => self.zed.prediction_debounce,
             settings::EditPredictionProvider::Mercury => self.mercury.prediction_debounce,
-            settings::EditPredictionProvider::None => DelayMs::default(),
+            settings::EditPredictionProvider::None
+            | settings::EditPredictionProvider::Supermaven => DelayMs::default(),
         };
         Duration::from_millis(delay.0)
     }
