@@ -1791,21 +1791,29 @@ impl LocalWorktree {
         let path_excluded = self.settings.is_path_excluded(&path);
         let fs = self.fs.clone();
         let task_abs_path = abs_path.clone();
-        let write = cx.background_spawn(async move {
-            if is_dir {
-                fs.create_dir(&task_abs_path)
-                    .await
-                    .with_context(|| format!("creating directory {task_abs_path:?}"))
-            } else {
-                fs.write(&task_abs_path, content.as_deref().unwrap_or(&[]))
-                    .await
-                    .with_context(|| format!("creating file {task_abs_path:?}"))
+        let write = cx.background_spawn({
+            let fs = fs.clone();
+            async move {
+                if is_dir {
+                    fs.create_dir(&task_abs_path)
+                        .await
+                        .with_context(|| format!("creating directory {task_abs_path:?}"))
+                } else {
+                    fs.write(&task_abs_path, content.as_deref().unwrap_or(&[]))
+                        .await
+                        .with_context(|| format!("creating file {task_abs_path:?}"))
+                }
             }
         });
 
         let lowest_ancestor = self.lowest_ancestor(&path);
         cx.spawn(async move |this, cx| {
             write.await?;
+            // A new directory doesn't bring back what was in a deleted one, so its
+            // deletion stays scheduled.
+            if !is_dir {
+                cancel_svn_deletion(fs.as_ref(), abs_path.clone(), cx).await;
+            }
             if path_excluded {
                 return Ok(CreatedEntry::Excluded { abs_path });
             }
@@ -1853,6 +1861,7 @@ impl LocalWorktree {
         let fs = self.fs.clone();
         let is_private = self.is_path_private(&path);
         let abs_path = self.absolutize(&path);
+        let is_new_file = self.entry_for_path(&path).is_none();
 
         let write = cx.background_spawn({
             let fs = fs.clone();
@@ -1883,6 +1892,9 @@ impl LocalWorktree {
 
         cx.spawn(async move |this, cx| {
             write.await?;
+            if is_new_file {
+                cancel_svn_deletion(fs.as_ref(), abs_path.clone(), cx).await;
+            }
             let entry = this
                 .update(cx, |this, cx| {
                     this.as_local_mut()
@@ -1935,6 +1947,7 @@ impl LocalWorktree {
                 )
                 .await?
             };
+            record_svn_deletion(fs.as_ref(), abs_path, cx).await;
 
             this.update(cx, |this, _| {
                 this.as_local_mut()
@@ -1965,6 +1978,7 @@ impl LocalWorktree {
                 )
                 .await?
             };
+            record_svn_deletion(fs.as_ref(), abs_path, cx).await;
 
             this.update(cx, |this, _| {
                 this.as_local_mut()
@@ -1989,6 +2003,7 @@ impl LocalWorktree {
 
         cx.spawn(async move |this, cx| {
             let path_buf = fs.restore(trash_id).await?;
+            cancel_svn_deletion(fs.as_ref(), path_buf.clone(), cx).await;
             let path = path_buf
                 .strip_prefix(worktree_abs_path)
                 .context("Could not strip prefix")?;
@@ -2263,6 +2278,41 @@ impl LocalWorktree {
             .values()
             .map(|entry| entry.work_directory_abs_path.clone())
             .collect::<Vec<_>>()
+    }
+}
+
+/// Runs `svn delete` on `abs_path` after it was removed, when it's versioned in a
+/// Subversion working copy, so that it's committed as a deletion rather than showing up
+/// as missing.
+async fn record_svn_deletion(fs: &dyn Fs, abs_path: PathBuf, cx: &AsyncApp) {
+    if fs.is_fake() {
+        return;
+    }
+    let result = cx
+        .background_spawn({
+            let abs_path = abs_path.clone();
+            async move { git::svn::delete_versioned_path(&abs_path).await }
+        })
+        .await;
+    if let Err(error) = result {
+        log::warn!("svn delete of {abs_path:?} failed: {error:#}");
+    }
+}
+
+/// Cancels the `svn delete` of `abs_path` after something was put back there, such as when
+/// it's restored from the trash, or a buffer whose file was deleted is saved.
+async fn cancel_svn_deletion(fs: &dyn Fs, abs_path: PathBuf, cx: &AsyncApp) {
+    if fs.is_fake() {
+        return;
+    }
+    let result = cx
+        .background_spawn({
+            let abs_path = abs_path.clone();
+            async move { git::svn::restore_deleted_path(&abs_path).await }
+        })
+        .await;
+    if let Err(error) = result {
+        log::error!("cancelling the svn delete of {abs_path:?} failed: {error:#}");
     }
 }
 

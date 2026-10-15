@@ -80,14 +80,16 @@ pub fn working_copy_root(path: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
+/// `svn` fails instead of waiting when another `svn` process holds the working copy's lock,
+/// so the edits made for file operations in the project, which can run concurrently when
+/// several files are deleted or moved at once, take turns.
+static WORKING_COPY_EDIT_LOCK: futures::lock::Mutex<()> = futures::lock::Mutex::new(());
+
 /// Moves `from` to `to` with `svn move` so that Subversion records the move, and
 /// returns `false` without touching anything when `from` isn't versioned or the
 /// destination isn't in the same working copy.
 pub async fn move_versioned_path(from: &Path, to: &Path) -> Result<bool> {
-    let Some(root) = working_copy_root(from) else {
-        return Ok(false);
-    };
-    let Ok(svn_binary_path) = which::which("svn") else {
+    let Some((svn, from_relative)) = svn_for_path(from)? else {
         return Ok(false);
     };
     let Some(destination_parent) = to.parent() else {
@@ -97,25 +99,13 @@ pub async fn move_versioned_path(from: &Path, to: &Path) -> Result<bool> {
         .ancestors()
         .find(|ancestor| ancestor.exists())
         .and_then(working_copy_root);
-    if destination_root.as_deref() != Some(root.as_path()) {
+    if destination_root.as_deref() != Some(svn.working_directory.as_path()) {
         return Ok(false);
     }
+    let to_relative = relative_path_string(&svn.working_directory, to)?;
 
-    let svn = SvnBinary {
-        path: svn_binary_path,
-        working_directory: root.clone(),
-    };
-    let from_relative = relative_path_string(&root, from)?;
-    let to_relative = relative_path_string(&root, to)?;
-
-    // `svn info` fails for anything that isn't versioned.
-    let info = svn
-        .output_with_args(
-            [OsString::from("info"), "--".into()],
-            [path_target(&from_relative)],
-        )
-        .await?;
-    if !info.status.success() {
+    let _lock = WORKING_COPY_EDIT_LOCK.lock().await;
+    if !is_versioned(&svn, &from_relative).await? {
         return Ok(false);
     }
 
@@ -131,6 +121,112 @@ pub async fn move_versioned_path(from: &Path, to: &Path) -> Result<bool> {
     )
     .await?;
     Ok(true)
+}
+
+/// Schedules `path`, which was just removed from disk, for deletion with `svn delete`, so
+/// that it's committed as a deletion rather than showing up as missing. Returns `false`
+/// without doing anything when `path` isn't versioned.
+pub async fn delete_versioned_path(path: &Path) -> Result<bool> {
+    let Some((svn, relative_path)) = svn_for_path(path)? else {
+        return Ok(false);
+    };
+
+    let _lock = WORKING_COPY_EDIT_LOCK.lock().await;
+    if !is_versioned(&svn, &relative_path).await? {
+        return Ok(false);
+    }
+    svn.run_with_args(
+        [OsString::from("delete"), "--".into()],
+        [path_target(&relative_path)],
+    )
+    .await?;
+    Ok(true)
+}
+
+/// Cancels the scheduled deletion of `path` after it was put back on disk, keeping what's
+/// on disk now. Returns `false` without doing anything when `path` isn't scheduled for
+/// deletion.
+pub async fn restore_deleted_path(path: &Path) -> Result<bool> {
+    let Some((svn, relative_path)) = svn_for_path(path)? else {
+        return Ok(false);
+    };
+
+    let _lock = WORKING_COPY_EDIT_LOCK.lock().await;
+    let schedule = svn
+        .output_with_args(
+            [
+                OsString::from("info"),
+                "--show-item".into(),
+                "schedule".into(),
+                "--".into(),
+            ],
+            [path_target(&relative_path)],
+        )
+        .await?;
+    if !schedule.status.success() || String::from_utf8_lossy(&schedule.stdout).trim() != "delete" {
+        return Ok(false);
+    }
+
+    // `svn revert` is the only way to cancel a deletion, and it also replaces the contents
+    // with their BASE versions, so the contents are set aside while it runs.
+    let temporary_directory = svn.working_directory.join(DOT_SVN).join("tmp");
+    std::fs::create_dir_all(&temporary_directory)
+        .with_context(|| format!("creating {temporary_directory:?}"))?;
+    let set_aside_path = temporary_directory.join(format!("zed-restore-{}", uuid::Uuid::new_v4()));
+    std::fs::rename(path, &set_aside_path)
+        .with_context(|| format!("moving {path:?} to {set_aside_path:?}"))?;
+    let revert = svn
+        .run_with_args(
+            [
+                OsString::from("revert"),
+                "--depth".into(),
+                "infinity".into(),
+                "--".into(),
+            ],
+            [path_target(&relative_path)],
+        )
+        .await;
+    remove_path(path)
+        .and_then(|()| std::fs::rename(&set_aside_path, path))
+        .with_context(|| format!("moving {path:?} back from {set_aside_path:?}"))?;
+    revert?;
+    Ok(true)
+}
+
+/// Returns `svn` set up to run in the working copy containing `path`, along with `path`
+/// relative to the working copy's root.
+fn svn_for_path(path: &Path) -> Result<Option<(SvnBinary, String)>> {
+    let Some(root) = working_copy_root(path) else {
+        return Ok(None);
+    };
+    let Ok(svn_binary_path) = which::which("svn") else {
+        return Ok(None);
+    };
+    let relative_path = relative_path_string(&root, path)?;
+    Ok(Some((
+        SvnBinary {
+            path: svn_binary_path,
+            working_directory: root,
+        },
+        relative_path,
+    )))
+}
+
+/// `svn info` fails for anything that isn't versioned.
+async fn is_versioned(svn: &SvnBinary, path: &str) -> Result<bool> {
+    let info = svn
+        .output_with_args([OsString::from("info"), "--".into()], [path_target(path)])
+        .await?;
+    Ok(info.status.success())
+}
+
+fn remove_path(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(path),
+        Ok(_) => std::fs::remove_file(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn relative_path_string(root: &Path, path: &Path) -> Result<String> {
@@ -450,6 +546,94 @@ fn path_target(path: &str) -> OsString {
     } else {
         path.into()
     }
+}
+
+/// Returns the contents of a file that lists `paths` for `svn`'s `--targets` option.
+fn targets_file_contents(paths: &[String]) -> Result<Vec<u8>> {
+    let mut contents = Vec::new();
+    for path in paths {
+        let target = path_target(path);
+        let encoded = encode_for_svn(&target.to_string_lossy())?.with_context(|| {
+            format!(
+                "{path} can't be committed, because svn on Windows only accepts paths whose \
+                characters are in the system's code page"
+            )
+        })?;
+        contents.extend(encoded);
+        contents.push(b'\n');
+    }
+    Ok(contents)
+}
+
+/// Encodes text that `svn` reads from a file, returning `None` if `svn` can't decode it.
+///
+/// `svn` decodes files like these with the system's ANSI code page on Windows, rather than
+/// UTF-8.
+#[cfg(windows)]
+fn encode_for_svn(text: &str) -> Result<Option<Vec<u8>>> {
+    use windows::Win32::Globalization::{
+        CP_UTF8, GetACP, WC_NO_BEST_FIT_CHARS, WideCharToMultiByte,
+    };
+    use windows::core::{BOOL, PCSTR};
+
+    // SAFETY: `GetACP` has no preconditions.
+    let code_page = unsafe { GetACP() };
+    // Conversions to UTF-8 don't support the flags below, and empty strings can't be converted.
+    if code_page == CP_UTF8 || text.is_empty() {
+        return Ok(Some(text.as_bytes().to_vec()));
+    }
+
+    let wide_text = text.encode_utf16().collect::<Vec<_>>();
+    let mut used_default_char = BOOL::default();
+    // Without `WC_NO_BEST_FIT_CHARS`, characters that aren't in the code page are replaced
+    // with similar ones, which could name a different file.
+    //
+    // SAFETY: Passing no output buffer only measures the encoded length.
+    let length = unsafe {
+        WideCharToMultiByte(
+            code_page,
+            WC_NO_BEST_FIT_CHARS,
+            &wide_text,
+            None,
+            PCSTR::null(),
+            Some(&mut used_default_char),
+        )
+    };
+    if length <= 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("encoding {text:?} in code page {code_page}"));
+    }
+    if used_default_char.as_bool() {
+        return Ok(None);
+    }
+
+    let mut encoded = vec![0; length as usize];
+    // SAFETY: `encoded` has room for the `length` bytes measured above.
+    let length = unsafe {
+        WideCharToMultiByte(
+            code_page,
+            WC_NO_BEST_FIT_CHARS,
+            &wide_text,
+            Some(&mut encoded),
+            PCSTR::null(),
+            None,
+        )
+    };
+    if length <= 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("encoding {text:?} in code page {code_page}"));
+    }
+    encoded.truncate(length as usize);
+    Ok(Some(encoded))
+}
+
+/// Encodes text that `svn` reads from a file, returning `None` if `svn` can't decode it.
+///
+/// `svn` decodes files like these with the locale's encoding, which is UTF-8 unless the user
+/// set a locale with another one.
+#[cfg(not(windows))]
+fn encode_for_svn(text: &str) -> Result<Option<Vec<u8>>> {
+    Ok(Some(text.as_bytes().to_vec()))
 }
 
 fn repo_path_targets(paths: &[RepoPath]) -> Vec<OsString> {
@@ -1110,6 +1294,8 @@ impl GitRepository for SvnRepository {
             if plan.targets.is_empty() {
                 bail!("No changes to commit");
             }
+            // Encoded before changing anything, since not every path can be.
+            let targets_file_contents = targets_file_contents(&plan.targets)?;
             if !plan.to_revert.is_empty() {
                 let targets = plan.to_revert.iter().map(String::as_str).map(path_target);
                 svn.run_with_args(
@@ -1136,10 +1322,7 @@ impl GitRepository for SvnRepository {
             message_file.write_all(message.as_bytes())?;
             message_file.flush()?;
             let mut targets_file = tempfile::NamedTempFile::new()?;
-            for target in &plan.targets {
-                targets_file.write_all(path_target(target).as_encoded_bytes())?;
-                targets_file.write_all(b"\n")?;
-            }
+            targets_file.write_all(&targets_file_contents)?;
             targets_file.flush()?;
 
             let output = svn
@@ -2832,6 +3015,28 @@ Details</msg>
     }
 
     #[test]
+    fn test_targets_file_contents() {
+        assert_eq!(
+            targets_file_contents(&["a.txt".into(), "dir/b@2x.png".into()]).unwrap(),
+            b"a.txt\ndir/b@2x.png@\n"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_targets_file_contents_in_code_page() {
+        // SAFETY: `GetACP` has no preconditions.
+        if unsafe { windows::Win32::Globalization::GetACP() } != 1252 {
+            return;
+        }
+        assert_eq!(
+            targets_file_contents(&["dir with space/naïve.txt".into()]).unwrap(),
+            b"dir with space/na\xEFve.txt\n"
+        );
+        assert!(targets_file_contents(&["snow☃.txt".into()]).is_err());
+    }
+
+    #[test]
     fn test_diff_stats() {
         let diff = "\
 Index: a.txt
@@ -3469,6 +3674,113 @@ Cannot display: file marked as a binary type.
                 "Core/Services/B.cs"
             ]
         );
+    }
+
+    #[gpui::test]
+    async fn test_delete_and_restore(cx: &mut TestAppContext) {
+        if !svn_available() {
+            return;
+        }
+        cx.executor().allow_parking();
+        let root = tempfile::tempdir().unwrap();
+        let (_, working_copy) = create_working_copy(
+            root.path(),
+            &[("a.txt", "a\n"), ("dir/b.txt", "b\n"), ("dir/c.txt", "c\n")],
+        );
+        write_file(&working_copy, "a.txt", "a changed\n");
+        write_file(&working_copy, "dir/b.txt", "b changed\n");
+        write_file(&working_copy, "dir/new.txt", "new\n");
+        write_file(&working_copy, "scratch.txt", "scratch\n");
+        let svn_status = || {
+            // Windows prints paths with backslashes.
+            let mut lines = run(&working_copy, "svn", &["status"])
+                .replace('\\', "/")
+                .lines()
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            lines.sort();
+            lines
+        };
+
+        let trash = root.path().join("trash");
+        fs::create_dir(&trash).unwrap();
+        for path in ["a.txt", "dir", "scratch.txt"] {
+            fs::rename(working_copy.join(path), trash.join(path)).unwrap();
+        }
+        assert!(
+            delete_versioned_path(&working_copy.join("a.txt"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            delete_versioned_path(&working_copy.join("dir"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !delete_versioned_path(&working_copy.join("scratch.txt"))
+                .await
+                .unwrap()
+        );
+        assert_eq!(svn_status(), ["D       a.txt", "D       dir"]);
+
+        // Restoring keeps the restored contents rather than reverting them to BASE.
+        for path in ["a.txt", "dir", "scratch.txt"] {
+            fs::rename(trash.join(path), working_copy.join(path)).unwrap();
+        }
+        assert!(
+            restore_deleted_path(&working_copy.join("a.txt"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            restore_deleted_path(&working_copy.join("dir"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !restore_deleted_path(&working_copy.join("dir/c.txt"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !restore_deleted_path(&working_copy.join("scratch.txt"))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            svn_status(),
+            [
+                "?       dir/new.txt",
+                "?       scratch.txt",
+                "M       a.txt",
+                "M       dir/b.txt"
+            ]
+        );
+        assert_eq!(
+            fs::read_to_string(working_copy.join("a.txt")).unwrap(),
+            "a changed\n"
+        );
+        assert_eq!(
+            fs::read_to_string(working_copy.join("dir/b.txt")).unwrap(),
+            "b changed\n"
+        );
+        assert_eq!(
+            fs::read_to_string(working_copy.join("dir/new.txt")).unwrap(),
+            "new\n"
+        );
+        let leftovers = fs::read_dir(working_copy.join(DOT_SVN).join("tmp"))
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("zed-restore")
+            })
+            .count();
+        assert_eq!(leftovers, 0);
     }
 
     #[gpui::test]

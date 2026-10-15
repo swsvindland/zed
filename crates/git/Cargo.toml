@@ -51,6 +51,9 @@ which.workspace = true
 futures.workspace = true
 ztracing.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_Globalization"] }
+
 [dev-dependencies]
 pretty_assertions.workspace = true
 serde_json.workspace = true

@@ -516,3 +516,54 @@ async fn test_svn_working_copy_opened_from_subdirectory(cx: &mut TestAppContext)
     )
     .await;
 }
+
+#[gpui::test]
+async fn test_svn_delete_entry(cx: &mut TestAppContext) {
+    if !svn_available() {
+        return;
+    }
+    init_test(cx);
+    cx.executor().allow_parking();
+    let root = tempfile::tempdir().unwrap();
+    let working_copy = create_working_copy(root.path(), &[("a.txt", "a\n"), ("b.txt", "b\n")]);
+
+    let (project, repository) = open_project(&working_copy, cx).await;
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(working_copy.join("a.txt"), cx)
+        })
+        .await
+        .unwrap();
+
+    // Deleting a versioned file in the project records an `svn delete`.
+    let entry_id = project.read_with(cx, |project, cx| {
+        project
+            .entry_for_path(
+                &ProjectPath {
+                    worktree_id: project.worktrees(cx).next().unwrap().read(cx).id(),
+                    path: rel_path("a.txt").into(),
+                },
+                cx,
+            )
+            .unwrap()
+            .id
+    });
+    project
+        .update(cx, |project, cx| project.delete_entry(entry_id, cx))
+        .unwrap()
+        .await
+        .unwrap();
+    wait_for_statuses(&repository, &[("a.txt", staged(StatusCode::Deleted))], cx).await;
+    assert_eq!(
+        run(&working_copy, "svn", &["status"]).trim(),
+        "D       a.txt"
+    );
+
+    // Saving the deleted file's buffer puts it back, which cancels its deletion.
+    project
+        .update(cx, |project, cx| project.save_buffer(buffer.clone(), cx))
+        .await
+        .unwrap();
+    wait_for_statuses(&repository, &[], cx).await;
+    assert_eq!(run(&working_copy, "svn", &["status"]), "");
+}
