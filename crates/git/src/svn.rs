@@ -943,20 +943,38 @@ impl GitRepository for SvnRepository {
 
     fn checkout_files(
         &self,
-        commit: String,
+        commit: Option<String>,
         paths: Vec<RepoPath>,
         env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>> {
         let svn = self.svn.clone();
         self.executor
             .spawn(async move {
-                if commit != "HEAD" {
+                if commit.as_deref().is_some_and(|commit| commit != "HEAD") {
                     bail!("Subversion can only restore files to their checked-out revision");
                 }
                 if paths.is_empty() {
                     return Ok(());
                 }
                 let entries = status_entries(&svn, &[]).await?;
+                // Staged changes only exist in the working tree, so restoring from the index
+                // has to leave staged files alone and only discard the unstaged ones.
+                let paths = if commit.is_some() {
+                    paths
+                } else {
+                    let unstaged_paths = entries
+                        .iter()
+                        .filter(|entry| entry.is_excluded_from_commit())
+                        .map(|entry| entry.path.as_str())
+                        .collect::<HashSet<_>>();
+                    paths
+                        .into_iter()
+                        .filter(|path| unstaged_paths.contains(path.as_unix_str()))
+                        .collect::<Vec<_>>()
+                };
+                if paths.is_empty() {
+                    return Ok(());
+                }
                 let removed_paths = entries
                     .iter()
                     .filter(|entry| matches!(entry.item, ItemStatus::Missing | ItemStatus::Deleted))
@@ -3420,9 +3438,9 @@ Cannot display: file marked as a binary type.
             "r3".to_string()
         );
 
-        // Discarding changes restores the file and takes it out of the changelist.
+        // Discarding unstaged changes restores the file and takes it out of the changelist.
         repository
-            .checkout_files("HEAD".into(), vec![repo_path("b.txt")], env.clone())
+            .checkout_files(None, vec![repo_path("b.txt")], env.clone())
             .await
             .unwrap();
         assert_eq!(
@@ -3434,6 +3452,25 @@ Cannot display: file marked as a binary type.
             statuses(&repository, &[]).await,
             [("b.txt".to_string(), staged(StatusCode::Modified))]
         );
+
+        // Discarding unstaged changes keeps staged ones, and discarding from HEAD doesn't.
+        repository
+            .checkout_files(None, vec![repo_path("b.txt")], env.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(working_copy.join("b.txt")).unwrap(),
+            "changed again\n"
+        );
+        repository
+            .checkout_files(Some("HEAD".into()), vec![repo_path("b.txt")], env.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(working_copy.join("b.txt")).unwrap(),
+            "bee\n"
+        );
+        assert_eq!(statuses(&repository, &[]).await, []);
     }
 
     #[gpui::test]
