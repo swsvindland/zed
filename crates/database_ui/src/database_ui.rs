@@ -4,6 +4,9 @@
 mod connection_modal;
 mod console;
 mod database_panel;
+#[cfg(test)]
+mod database_ui_tests;
+mod push_modal;
 mod results_view;
 mod sql_language;
 
@@ -316,4 +319,17 @@ pub(crate) fn show_error(
         ),
         cx,
     );
+}
+
+#[cfg(test)]
+impl DatabaseStore {
+    pub(crate) fn set_connections_for_test(
+        &mut self,
+        connections: ConnectionsFile,
+        cx: &mut Context<Self>,
+    ) {
+        self.connections = connections;
+        cx.emit(DatabaseStoreEvent::ConnectionsChanged);
+        cx.notify();
+    }
 }

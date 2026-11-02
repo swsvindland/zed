@@ -1,5 +1,5 @@
 use crate::types::TableCell;
-use gpui::{AnyElement, Entity, Hsla};
+use gpui::{AnyElement, Entity, Hsla, MouseButton, MouseDownEvent};
 use std::ops::Range;
 use ui::{ColumnWidthConfig, ResizableColumnsState, Table, UncheckedTableRow, div, prelude::*};
 
@@ -113,22 +113,38 @@ impl TableView {
         for col in (0..this.engine.contents.number_of_cols).map(AnyColumn) {
             let table_cell = row.expect_get(col);
 
-            // TODO: Introduce `<null>` cell type
-            let cell_content = table_cell.display_value().cloned().unwrap_or_default();
-
             let display_cell_id = DisplayCellId::new(display_row, col);
             let data_cell_id = DataCellId::new(data_row, col);
+            let decoration = this.cell_decorations.get(&data_cell_id);
+            let row_decoration = this.row_decorations.get(&data_row);
+
+            // TODO: Introduce `<null>` cell type
+            let cell_content = decoration
+                .and_then(|decoration| decoration.text.clone())
+                .or_else(|| table_cell.display_value().cloned())
+                .unwrap_or_default();
+            let is_muted = decoration
+                .or(row_decoration)
+                .is_some_and(|decoration| decoration.muted);
+            let decoration_bg = decoration
+                .and_then(|decoration| decoration.background)
+                .or_else(|| row_decoration.and_then(|decoration| decoration.background));
 
             let is_focus_cell = this
                 .selection
                 .as_ref()
                 .is_some_and(|selection| selection.focus == data_cell_id);
 
-            let cell_bg = if is_focus_cell {
-                Some(cx.theme().colors().element_selected)
-            } else {
-                None
+            let cell_bg = match (is_focus_cell, decoration_bg) {
+                (_, Some(background)) => Some(background),
+                (true, None) => Some(cx.theme().colors().element_selected),
+                (false, None) => None,
             };
+            let cell_editor = this
+                .cell_editor
+                .as_ref()
+                .filter(|(cell, _)| *cell == data_cell_id)
+                .map(|(_, editor)| editor.clone());
 
             let cell = div()
                 .size_full()
@@ -141,17 +157,38 @@ impl TableView {
                             .overflow_hidden()
                     },
                 )
-                .child(TableView::create_selectable_cell(
-                    display_cell_id,
-                    cell_content,
-                    this.settings.vertical_alignment,
-                    cx,
-                ));
+                .when(is_muted, |div| {
+                    div.text_color(cx.theme().colors().text_muted)
+                })
+                .child(match cell_editor {
+                    Some(editor) => div().size_full().px_1().child(editor).into_any_element(),
+                    None => TableView::create_selectable_cell(
+                        display_cell_id,
+                        cell_content,
+                        this.settings.vertical_alignment,
+                        cx,
+                    ),
+                });
 
             elements.push(
                 div()
                     .size_full()
                     .when_some(cell_bg, |div, color| div.bg(color))
+                    .when(is_focus_cell && decoration_bg.is_some(), |div| {
+                        div.border_1()
+                            .border_color(cx.theme().colors().border_focused)
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            this.select_cell_with_mouse(
+                                data_cell_id,
+                                event.click_count,
+                                window,
+                                cx,
+                            );
+                        }),
+                    )
                     .when(this.settings.show_debug_info, |parent| {
                         parent.child(div().text_color(row_identifier_text_color).child(
                             match table_cell {

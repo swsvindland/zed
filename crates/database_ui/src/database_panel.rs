@@ -1023,3 +1023,30 @@ fn open_select_top(
         })
         .log_err();
 }
+
+#[cfg(test)]
+impl DatabasePanel {
+    pub(crate) fn expand_connection_for_test(
+        &mut self,
+        connection_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let key = NodeKey::Connection {
+            connection_id: connection_id.to_string(),
+        };
+        if !self.expanded.contains(&key) {
+            self.toggle_expanded(&key, cx);
+        }
+    }
+
+    pub(crate) fn visible_labels(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter_map(|entry| match &entry.kind {
+                EntryKind::Node { label, .. } => Some(label.to_string()),
+                EntryKind::Loading => None,
+                EntryKind::Error(error) => Some(format!("error: {error}")),
+            })
+            .collect()
+    }
+}
