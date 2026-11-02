@@ -13,7 +13,8 @@ use std::{
 };
 
 use gpui::{
-    App, AppContext, Entity, FocusHandle, Focusable, ListAlignment, ListState, Point, Task, Window,
+    AnyView, App, AppContext, Entity, EventEmitter, FocusHandle, Focusable, Hsla, KeyDownEvent,
+    ListAlignment, ListState, Point, Task, Window,
 };
 use ui::{
     AbsoluteLength, ResizableColumnsState, SharedString, TableInteractionState,
@@ -24,7 +25,7 @@ use crate::{
     MoveFocusedCell, NavigationDirection,
     settings::TableViewSettings,
     table_data_engine::{DisplayToDataMapping, TableDataEngine},
-    types::{AnyColumn, DataCellId, DisplayRow, TableLikeContent},
+    types::{AnyColumn, DataCellId, DataRow, DisplayRow, TableLikeContent},
 };
 
 /// The keyboard cursor: which cell is currently focused for navigation.
@@ -51,6 +52,25 @@ impl CellSelection {
     pub fn is_single_cell(&self) -> bool {
         self.anchor == self.focus
     }
+}
+
+/// Overrides how a cell (or every cell in a row) is drawn, for producers that layer changes on
+/// top of their content, such as a database result grid with unsaved edits.
+#[derive(Clone, Debug, Default)]
+pub struct CellDecoration {
+    /// Text shown instead of the content's value.
+    pub text: Option<SharedString>,
+    pub background: Option<Hsla>,
+    pub muted: bool,
+}
+
+#[derive(Clone, Debug)]
+pub enum TableViewEvent {
+    /// The user asked to edit a cell: double-click, Enter or F2, or typing (`initial_text`).
+    EditRequested {
+        cell: DataCellId,
+        initial_text: Option<String>,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -115,6 +135,11 @@ pub struct TableView {
     pub(crate) is_loading: bool,
     /// The keyboard navigation cursor. `None` until the user first navigates.
     pub(crate) selection: Option<CellSelection>,
+    pub(crate) selection_enabled: bool,
+    pub(crate) cell_decorations: HashMap<DataCellId, CellDecoration>,
+    pub(crate) row_decorations: HashMap<DataRow, CellDecoration>,
+    /// A view (typically an inline editor) drawn in place of one cell's text.
+    pub(crate) cell_editor: Option<(DataCellId, AnyView)>,
 }
 
 impl TableView {
@@ -146,6 +171,10 @@ impl TableView {
             row_height,
             is_loading: false,
             selection: None,
+            selection_enabled: cfg!(any(test, debug_assertions)),
+            cell_decorations: HashMap::default(),
+            row_decorations: HashMap::default(),
+            cell_editor: None,
         }
     }
 
@@ -240,7 +269,111 @@ impl TableView {
 
     #[inline]
     pub(crate) fn is_selection_enabled(&self) -> bool {
-        cfg!(any(test, debug_assertions))
+        self.selection_enabled
+    }
+
+    /// Enables cell selection with the keyboard and mouse, which is otherwise limited to debug
+    /// builds while the CSV preview's selection UX is unfinished.
+    pub fn set_selection_enabled(&mut self, enabled: bool) {
+        self.selection_enabled = enabled;
+    }
+
+    pub fn selection(&self) -> Option<CellSelection> {
+        self.selection
+    }
+
+    pub fn select_cell(&mut self, cell: DataCellId, cx: &mut Context<Self>) {
+        self.selection = Some(CellSelection::single_cell(cell));
+        cx.notify();
+    }
+
+    pub fn contents(&self) -> &TableLikeContent {
+        &self.engine.contents
+    }
+
+    pub fn set_decorations(
+        &mut self,
+        cells: HashMap<DataCellId, CellDecoration>,
+        rows: HashMap<DataRow, CellDecoration>,
+        cx: &mut Context<Self>,
+    ) {
+        self.cell_decorations = cells;
+        self.row_decorations = rows;
+        cx.notify();
+    }
+
+    pub fn set_cell_editor(
+        &mut self,
+        editor: Option<(DataCellId, AnyView)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.cell_editor = editor;
+        cx.notify();
+    }
+
+    pub(crate) fn select_cell_with_mouse(
+        &mut self,
+        cell: DataCellId,
+        click_count: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.selection_enabled {
+            return;
+        }
+        let is_editing_this_cell = self
+            .cell_editor
+            .as_ref()
+            .is_some_and(|(editing, _)| *editing == cell);
+        if is_editing_this_cell {
+            return;
+        }
+        self.selection = Some(CellSelection::single_cell(cell));
+        self.focus_handle.focus(window, cx);
+        if click_count >= 2 {
+            cx.emit(TableViewEvent::EditRequested {
+                cell,
+                initial_text: None,
+            });
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn handle_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Keys typed into an inline cell editor bubble through here too.
+        if !self.selection_enabled
+            || self.cell_editor.is_some()
+            || !self.focus_handle.is_focused(window)
+        {
+            return;
+        }
+        let Some(selection) = self.selection else {
+            return;
+        };
+        let keystroke = &event.keystroke;
+        let modifiers = keystroke.modifiers;
+        let initial_text = match keystroke.key.as_str() {
+            "enter" | "f2" if !modifiers.modified() => None,
+            _ if modifiers.control || modifiers.alt || modifiers.platform || modifiers.function => {
+                return;
+            }
+            _ => match keystroke.key_char.as_ref() {
+                Some(text) if !text.is_empty() && !text.chars().any(char::is_control) => {
+                    Some(text.clone())
+                }
+                _ => return,
+            },
+        };
+        cx.stop_propagation();
+        cx.emit(TableViewEvent::EditRequested {
+            cell: selection.focus,
+            initial_text,
+        });
     }
 
     pub(crate) fn move_focused_cell(
@@ -356,6 +489,8 @@ impl TableView {
         }
     }
 }
+
+impl EventEmitter<TableViewEvent> for TableView {}
 
 impl Focusable for TableView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
