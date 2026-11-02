@@ -5219,6 +5219,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "dotnet_ui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "collections",
+ "dotnet",
+ "gpui",
+ "ui",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "downcast-rs"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -22661,6 +22674,7 @@ dependencies = [
  "dev_container",
  "diagnostics",
  "dotnet",
+ "dotnet_ui",
  "edit_prediction",
  "edit_prediction_ui",
  "editor",
