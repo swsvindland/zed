@@ -17,6 +17,8 @@ use workspace::{
     dock::{DockPosition, Panel, PanelEvent},
 };
 
+use crate::nuget_panel::NuGetPanel;
+
 actions!(
     solution_explorer,
     [
@@ -288,7 +290,9 @@ impl SolutionExplorer {
                 self.open_file(path.clone(), window, cx)
             }
             NodeKey::ProjectReference(_, path) => self.open_file(path.clone(), window, cx),
-            NodeKey::Package(..) => {}
+            NodeKey::Package(project_path, package_id) => {
+                self.manage_packages(project_path.clone(), Some(package_id.clone()), window, cx)
+            }
             key => self.toggle(key, cx),
         }
         cx.notify();
@@ -302,6 +306,31 @@ impl SolutionExplorer {
                     .detach_and_log_err(cx);
             })
             .log_err();
+    }
+
+    fn manage_packages(
+        &self,
+        project_path: PathBuf,
+        package_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace = self.workspace.clone();
+        // Focusing the NuGet panel deactivates this panel when they share a dock, which would
+        // update this panel while it's still being updated.
+        window.defer(cx, move |window, cx| {
+            workspace
+                .update(cx, |workspace, cx| {
+                    let Some(panel) = workspace.panel::<NuGetPanel>(cx) else {
+                        return;
+                    };
+                    panel.update(cx, |panel, cx| {
+                        panel.show_project(project_path, package_id, window, cx)
+                    });
+                    workspace.focus_panel::<NuGetPanel>(window, cx);
+                })
+                .log_err();
+        });
     }
 
     fn deploy_context_menu(
@@ -436,6 +465,16 @@ impl SolutionExplorer {
                             });
                         }
                     }
+                    let manage = {
+                        let this = this.clone();
+                        let path = project.path.clone();
+                        move |window: &mut Window, cx: &mut App| {
+                            this.update(cx, |this, cx| {
+                                this.manage_packages(path.clone(), None, window, cx)
+                            })
+                            .log_err();
+                        }
+                    };
                     let open = {
                         let this = this.clone();
                         let path = project.path.clone();
@@ -445,7 +484,25 @@ impl SolutionExplorer {
                         }
                     };
                     menu.separator()
+                        .entry("Manage NuGet Packages…", None, manage)
                         .entry("Open Project File", None, open)
+                })
+            }
+            NodeKey::Package(project_path, package_id) => {
+                let project_path = project_path.clone();
+                let package_id = package_id.clone();
+                ContextMenu::build(window, cx, move |menu, _, _| {
+                    menu.entry("Manage Package…", None, move |window, cx| {
+                        this.update(cx, |this, cx| {
+                            this.manage_packages(
+                                project_path.clone(),
+                                Some(package_id.clone()),
+                                window,
+                                cx,
+                            )
+                        })
+                        .log_err();
+                    })
                 })
             }
             _ => return,
