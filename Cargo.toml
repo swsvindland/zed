@@ -49,6 +49,8 @@ members = [
     "crates/credentials_provider",
     "crates/dap",
     "crates/dap_adapters",
+    "crates/database",
+    "crates/database_ui",
     "crates/db",
     "crates/debug_adapter_extension",
     "crates/debugger_tools",
@@ -332,6 +334,8 @@ crashes = { path = "crates/crashes" }
 credentials_provider = { path = "crates/credentials_provider" }
 dap = { path = "crates/dap" }
 dap_adapters = { path = "crates/dap_adapters" }
+database = { path = "crates/database" }
+database_ui = { path = "crates/database_ui" }
 db = { path = "crates/db" }
 debug_adapter_extension = { path = "crates/debug_adapter_extension" }
 debugger_tools = { path = "crates/debugger_tools" }
