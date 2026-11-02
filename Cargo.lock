@@ -5357,6 +5357,7 @@ dependencies = [
  "gpui",
  "http_client",
  "pretty_assertions",
+ "project",
  "serde",
  "serde_json",
  "ui",

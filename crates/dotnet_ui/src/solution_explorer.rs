@@ -1,19 +1,24 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, anyhow};
 use collections::HashMap;
 use dotnet::{
     BuildVerb, DotnetProjects, MsBuildProject, OutputType, ProjectStyle, RunConfiguration, Solution,
 };
 use gpui::{
     Action, AnyElement, App, AsyncWindowContext, ClickEvent, Context, DismissEvent, Entity,
-    EventEmitter, FocusHandle, Focusable, MouseButton, MouseDownEvent, Pixels, Point, Render,
-    SharedString, Subscription, Task, WeakEntity, Window, actions, anchored, deferred, px,
+    EventEmitter, FocusHandle, Focusable, MouseButton, MouseDownEvent, PathPromptOptions, Pixels,
+    Point, Render, SharedString, Subscription, Task, WeakEntity, Window, actions, anchored,
+    deferred, px,
 };
+use project::DirectoryLister;
 use ui::{ContextMenu, Icon, IconName, IconSize, Label, LabelSize, ListItem, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::{
-    OpenOptions, Workspace,
+    MultiWorkspace, OpenMode, OpenOptions, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
 };
 
@@ -24,10 +29,15 @@ actions!(
     [
         /// Toggles focus on the .NET Solution Explorer.
         ToggleFocus,
+        /// Picks a .sln or .slnx file, opens its folder and shows the Solution Explorer.
+        OpenSolution,
     ]
 );
 
 const PANEL_KEY: &str = "SolutionExplorer";
+/// How long to wait for a newly opened workspace to add its Solution Explorer.
+const PANEL_WAIT_ATTEMPTS: usize = 50;
+const PANEL_WAIT_INTERVAL: Duration = Duration::from_millis(100);
 
 /// A Visual Studio-style tree of the workspace's .NET solutions, projects and their references,
 /// with build, run, debug and test commands per project.
@@ -82,6 +92,9 @@ impl SolutionExplorer {
                     .context("the .NET project model is not registered")?;
                 workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
                     workspace.toggle_panel_focus::<SolutionExplorer>(window, cx);
+                });
+                workspace.register_action(|workspace, _: &OpenSolution, window, cx| {
+                    open_solution(workspace, window, cx);
                 });
                 let workspace_handle = cx.entity().downgrade();
                 Ok(cx.new(|cx| Self::new(workspace_handle, projects, window, cx)))
@@ -349,6 +362,32 @@ impl SolutionExplorer {
         let menu = match &key {
             NodeKey::Solution(path) => {
                 let path = path.clone();
+                // A solution opened on its own, or found outside the open folders, can have its
+                // folder added so the file finder, search and project panel see its files.
+                let add_solution_folder = path
+                    .parent()
+                    .filter(|directory| {
+                        workspace.upgrade().is_some_and(|workspace| {
+                            workspace
+                                .read(cx)
+                                .project()
+                                .read(cx)
+                                .find_worktree(directory, cx)
+                                .is_none()
+                        })
+                    })
+                    .map(|directory| {
+                        let workspace = workspace.clone();
+                        let directory = directory.to_path_buf();
+                        let solution_path = path.clone();
+                        move |_: &mut Window, cx: &mut App| {
+                            workspace
+                                .update(cx, |workspace, cx| {
+                                    add_solution_folder(workspace, &solution_path, &directory, cx)
+                                })
+                                .log_err();
+                        }
+                    });
                 ContextMenu::build(window, cx, move |menu, _, _| {
                     let build = |verb: BuildVerb| {
                         let projects = projects.clone();
@@ -370,11 +409,20 @@ impl SolutionExplorer {
                                 .log_err();
                         }
                     };
-                    menu.entry("Build Solution", None, build(BuildVerb::Build))
+                    let menu = menu
+                        .entry("Build Solution", None, build(BuildVerb::Build))
                         .entry("Rebuild Solution", None, build(BuildVerb::Rebuild))
                         .entry("Clean Solution", None, build(BuildVerb::Clean))
                         .separator()
-                        .entry("Open Solution File", None, open)
+                        .entry("Open Solution File", None, open);
+                    match add_solution_folder.clone() {
+                        Some(add_solution_folder) => menu.entry(
+                            "Add Solution Folder to Workspace",
+                            None,
+                            add_solution_folder,
+                        ),
+                        None => menu,
+                    }
                 })
             }
             NodeKey::Project(_, path) => {
@@ -607,7 +655,134 @@ impl SolutionExplorer {
                         window.dispatch_action(dotnet::BuildSolution.boxed_clone(), cx)
                     }),
             )
+            .child(
+                IconButton::new("solution-explorer-open-solution", IconName::FolderOpen)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::for_action_title("Open Solution…", &OpenSolution))
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(OpenSolution.boxed_clone(), cx)
+                    }),
+            )
     }
+}
+
+/// Asks for a solution file and opens its folder the way `workspace: open` opens a folder, then
+/// focuses the Solution Explorer there.
+fn open_solution(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    let paths = workspace.prompt_for_open_path(
+        PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Open Solution".into()),
+        },
+        DirectoryLister::Local(workspace.project().clone(), workspace.app_state().fs.clone()),
+        window,
+        cx,
+    );
+    let multi_workspace = window.window_handle().downcast::<MultiWorkspace>();
+    cx.spawn_in(window, async move |workspace, cx| {
+        let Some(solution_path) = paths
+            .await
+            .log_err()
+            .flatten()
+            .and_then(|paths| paths.into_iter().next())
+        else {
+            return;
+        };
+        if !dotnet::is_solution_file(&solution_path) {
+            workspace
+                .update(cx, |workspace, cx| {
+                    workspace.show_error(
+                        anyhow!("{} is not a .sln or .slnx file", solution_path.display()),
+                        cx,
+                    );
+                })
+                .log_err();
+            return;
+        }
+        let Some(directory) = solution_path.parent().map(Path::to_path_buf) else {
+            return;
+        };
+
+        let opened = match multi_workspace {
+            Some(handle) => handle
+                .update(cx, |multi_workspace, window, cx| {
+                    multi_workspace.open_project(vec![directory], OpenMode::Activate, window, cx)
+                })
+                .log_err(),
+            None => workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.open_workspace_for_paths(
+                        OpenMode::NewWindow,
+                        vec![directory],
+                        window,
+                        cx,
+                    )
+                })
+                .log_err(),
+        };
+        let Some(opened) = opened else {
+            return;
+        };
+        let Some(opened) = opened.await.log_err() else {
+            return;
+        };
+        // A folder opened in another window is focused by its own window; only a workspace in
+        // this window can be focused from here.
+        if multi_workspace.is_none() {
+            return;
+        }
+
+        // Panels load asynchronously after the workspace opens.
+        for _ in 0..PANEL_WAIT_ATTEMPTS {
+            let focused = cx
+                .update(|window, cx| {
+                    opened.update(cx, |workspace, cx| {
+                        let has_panel = workspace.panel::<SolutionExplorer>(cx).is_some();
+                        if has_panel {
+                            workspace.focus_panel::<SolutionExplorer>(window, cx);
+                        }
+                        has_panel
+                    })
+                })
+                .unwrap_or(true);
+            if focused {
+                return;
+            }
+            cx.background_executor().timer(PANEL_WAIT_INTERVAL).await;
+        }
+    })
+    .detach();
+}
+
+/// Adds a solution's folder to the workspace, replacing a worktree that holds only the solution
+/// file (what opening a .sln file on its own creates).
+fn add_solution_folder(
+    workspace: &mut Workspace,
+    solution_path: &Path,
+    directory: &Path,
+    cx: &mut Context<Workspace>,
+) {
+    let project = workspace.project().clone();
+    let solution_file_worktree = project
+        .read(cx)
+        .worktrees(cx)
+        .find(|worktree| {
+            let worktree = worktree.read(cx);
+            worktree.is_single_file() && dotnet::same_path(&worktree.abs_path(), solution_path)
+        })
+        .map(|worktree| worktree.read(cx).id());
+    let create_worktree =
+        project.update(cx, |project, cx| project.find_or_create_worktree(directory, true, cx));
+    cx.spawn(async move |_, cx| {
+        create_worktree.await?;
+        if let Some(worktree_id) = solution_file_worktree {
+            project.update(cx, |project, cx| project.remove_worktree(worktree_id, cx));
+        }
+        anyhow::Ok(())
+    })
+    .detach_and_log_err(cx);
 }
 
 fn solution_file_name(solution: &Solution) -> String {
@@ -651,9 +826,14 @@ impl Render for SolutionExplorer {
                 .gap_2()
                 .child(Label::new("No .NET solutions or projects found."))
                 .child(
-                    Label::new("Open a folder that contains a .sln, .slnx or project file.")
+                    Label::new("Open a solution, or a folder that contains a .sln, .slnx or project file.")
                         .size(LabelSize::Small)
                         .color(Color::Muted),
+                )
+                .child(
+                    Button::new("solution-explorer-open-solution", "Open Solution…").on_click(
+                        |_, window, cx| window.dispatch_action(OpenSolution.boxed_clone(), cx),
+                    ),
                 )
                 .into_any_element()
         } else {

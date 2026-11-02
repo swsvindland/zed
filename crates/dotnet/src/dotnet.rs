@@ -34,12 +34,12 @@ use workspace::{StatusItemView, Workspace, item::ItemHandle};
 
 pub use msbuild::{
     BuildVerb, MsBuildProject, OutputType, PackageReference, ProjectStyle, RunConfiguration,
-    RunKind, Solution, same_path,
+    RunKind, Solution, is_solution_file, same_path,
 };
 use msbuild::{
     CommandLine, IisExpressSite, dotnet_build_command, dotnet_run_command,
     executable_output_directory, executable_path, find_iis_express_site_name, iis_express_command,
-    is_project_file, is_solution_file, msbuild_command, parse_launch_settings,
+    is_project_file, msbuild_command, parse_launch_settings,
     parse_packages_config, parse_project, parse_solution,
 };
 use run_configuration_picker::RunConfigurationPicker;
@@ -684,42 +684,73 @@ async fn load_project_model(
     let mut solutions = Vec::new();
     let mut projects = Vec::new();
     for path in paths {
-        let Some(contents) = fs
-            .load(&path)
-            .await
-            .with_context(|| format!("reading {}", path.display()))
-            .log_err()
-        else {
-            continue;
-        };
         if is_solution_file(&path) {
+            let Some(contents) = fs
+                .load(&path)
+                .await
+                .with_context(|| format!("reading {}", path.display()))
+                .log_err()
+            else {
+                continue;
+            };
             if let Some(solution) = parse_solution(&path, &contents)
                 .with_context(|| format!("parsing {}", path.display()))
                 .log_err()
             {
                 solutions.push(solution);
             }
-        } else if let Some(mut project) = parse_project(&path, &contents)
-            .with_context(|| format!("parsing {}", path.display()))
-            .log_err()
+        } else if let Some(project) = load_project(fs, &path).await {
+            projects.push(project);
+        }
+    }
+
+    // Solutions often list projects outside the folders that are open, such as
+    // `..\Shared\Shared.csproj`, or the whole solution when only its file was opened.
+    let mut outside_projects = Vec::<PathBuf>::new();
+    for project_path in solutions.iter().flat_map(|solution| &solution.projects) {
+        let already_known = projects
+            .iter()
+            .any(|project| same_path(&project.path, project_path))
+            || outside_projects
+                .iter()
+                .any(|path| same_path(path, project_path));
+        if !already_known {
+            outside_projects.push(project_path.clone());
+        }
+    }
+    for path in outside_projects {
+        if fs.is_file(&path).await
+            && let Some(project) = load_project(fs, &path).await
         {
-            project.launch_profiles = load_launch_profiles(fs, &project).await;
-            let packages_config = project.directory().join(PACKAGES_CONFIG);
-            if fs.is_file(&packages_config).await
-                && let Some(packages) = fs
-                    .load(&packages_config)
-                    .await
-                    .and_then(|contents| parse_packages_config(&contents))
-                    .with_context(|| format!("reading {}", packages_config.display()))
-                    .log_err()
-            {
-                project.package_references = packages;
-                project.uses_packages_config = true;
-            }
             projects.push(project);
         }
     }
     (solutions, projects)
+}
+
+async fn load_project(fs: &dyn Fs, path: &Path) -> Option<MsBuildProject> {
+    let contents = fs
+        .load(path)
+        .await
+        .with_context(|| format!("reading {}", path.display()))
+        .log_err()?;
+    let mut project = parse_project(path, &contents)
+        .with_context(|| format!("parsing {}", path.display()))
+        .log_err()?;
+    project.launch_profiles = load_launch_profiles(fs, &project).await;
+    let packages_config = project.directory().join(PACKAGES_CONFIG);
+    if fs.is_file(&packages_config).await
+        && let Some(packages) = fs
+            .load(&packages_config)
+            .await
+            .and_then(|contents| parse_packages_config(&contents))
+            .with_context(|| format!("reading {}", packages_config.display()))
+            .log_err()
+    {
+        project.package_references = packages;
+        project.uses_packages_config = true;
+    }
+    Some(project)
 }
 
 async fn load_launch_profiles(fs: &dyn Fs, project: &MsBuildProject) -> Vec<String> {
@@ -1033,6 +1064,42 @@ mod tests {
     use task::ResolvedTask;
     use util::path;
     use workspace::{AppState, MultiWorkspace};
+
+    #[gpui::test]
+    async fn loads_solution_projects_outside_open_folders(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "app": {
+                    "App.sln": "Microsoft Visual Studio Solution File, Format Version 12.00\n\
+                        Project(\"{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}\") = \"App\", \"App\\App.csproj\", \"{4CFE6531-67B4-4C56-9DEE-79F74621AE96}\"\nEndProject\n\
+                        Project(\"{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}\") = \"Shared\", \"..\\shared\\Shared.csproj\", \"{BFB0C338-BA0A-4F4C-994B-9F9F02376D49}\"\nEndProject\n\
+                        Project(\"{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}\") = \"Missing\", \"..\\missing\\Missing.csproj\", \"{5E2B4B3A-1C1D-4F0E-9B7E-2A1C3D4E5F60}\"\nEndProject\n",
+                    "App": {
+                        "App.csproj": r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>"#,
+                    },
+                },
+                "shared": {
+                    "Shared.csproj": r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>netstandard2.0</TargetFramework></PropertyGroup></Project>"#,
+                },
+            }),
+        )
+        .await;
+
+        // Only the solution file is open, as when a .sln is opened on its own.
+        let (solutions, projects) =
+            load_project_model(fs.as_ref(), vec![PathBuf::from(path!("/root/app/App.sln"))])
+                .await;
+
+        assert_eq!(solutions.len(), 1);
+        let mut project_names = projects
+            .iter()
+            .map(|project| project.name.clone())
+            .collect::<Vec<_>>();
+        project_names.sort();
+        assert_eq!(project_names, vec!["App", "Shared"]);
+    }
 
     #[gpui::test]
     async fn discovers_and_runs_configurations(cx: &mut TestAppContext) {
