@@ -1,3 +1,4 @@
+mod debug;
 mod msbuild;
 mod run_configuration_picker;
 mod solution_view;
@@ -10,16 +11,17 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, anyhow};
+use dap::DapRegistry;
 use db::kvp::KeyValueStore;
 use fs::Fs;
 use futures::StreamExt as _;
 use gpui::{
     App, AppContext as _, Context, Entity, IntoElement, ParentElement, Render, Styled,
-    Subscription, Task, WeakEntity, Window, actions, div,
+    Subscription, Task, WeakEntity, Window, actions, div, prelude::FluentBuilder as _,
 };
 use project::{Project, TaskSourceKind};
 use project_panel::ProjectView;
-use task::{RevealStrategy, SaveStrategy, TaskContext, TaskTemplate};
+use task::{RevealStrategy, SaveStrategy, SharedTaskContext, TaskContext, TaskTemplate};
 use ui::{
     Button, ButtonCommon, Clickable, IconButton, IconName, IconSize, LabelSize, Tooltip, h_flex,
 };
@@ -30,13 +32,16 @@ use util::{
 };
 use workspace::{StatusItemView, Workspace, item::ItemHandle};
 
-use msbuild::{
-    BuildVerb, CommandLine, IisExpressSite, ProjectStyle, dotnet_build_command, dotnet_run_command,
-    executable_output_directory, executable_path, find_iis_express_site_name, iis_express_command,
-    is_project_file, is_solution_file, msbuild_command, parse_launch_settings, parse_project,
-    parse_solution, same_path,
+pub use msbuild::{
+    BuildVerb, MsBuildProject, OutputType, PackageReference, ProjectStyle, RunConfiguration,
+    RunKind, Solution, same_path,
 };
-pub use msbuild::{MsBuildProject, RunConfiguration, RunKind, Solution};
+use msbuild::{
+    CommandLine, IisExpressSite, dotnet_build_command, dotnet_run_command,
+    executable_output_directory, executable_path, find_iis_express_site_name, iis_express_command,
+    is_project_file, is_solution_file, msbuild_command, parse_launch_settings,
+    parse_packages_config, parse_project, parse_solution,
+};
 use run_configuration_picker::RunConfigurationPicker;
 use solution_view::SolutionView;
 
@@ -45,6 +50,8 @@ actions!(
     [
         /// Builds and runs the selected .NET run configuration.
         Run,
+        /// Builds the selected .NET run configuration and starts it under the debugger.
+        Debug,
         /// Selects the .NET project and launch profile that `dotnet: run` starts.
         SelectRunConfiguration,
         /// Builds the project of the selected .NET run configuration.
@@ -59,6 +66,7 @@ actions!(
 );
 
 const RUN_CONFIGURATION_NAMESPACE: &str = "dotnet_run_configuration";
+const PACKAGES_CONFIG: &str = "packages.config";
 const SCAN_DEBOUNCE: Duration = Duration::from_millis(500);
 const MSBUILD_NOT_FOUND: &str = "MSBuild.exe was not found. Install Visual Studio or the \
     Visual Studio Build Tools with the MSBuild component to build legacy .NET Framework projects.";
@@ -69,11 +77,17 @@ pub fn register(
     _window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Entity<RunConfigurationIndicator> {
+    // The registry is keyed by name, so registering again for each workspace is harmless.
+    DapRegistry::global(cx).add_locator(Arc::new(debug::DotnetLocator));
     let projects = cx.new(|cx| DotnetProjects::new(workspace.project().clone(), cx));
 
     workspace.register_action({
         let projects = projects.clone();
         move |workspace, _: &Run, window, cx| run(&projects, workspace, window, cx)
+    });
+    workspace.register_action({
+        let projects = projects.clone();
+        move |workspace, _: &Debug, window, cx| debug(&projects, workspace, window, cx)
     });
     workspace.register_action({
         let projects = projects.clone();
@@ -120,6 +134,50 @@ fn run(
     }
 }
 
+fn debug(
+    projects: &Entity<DotnetProjects>,
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    match projects.read(cx).active_run_configuration.clone() {
+        Some(configuration) => debug_configuration(projects, configuration, workspace, window, cx),
+        None => RunConfigurationPicker::toggle(projects.clone(), workspace, window, cx),
+    }
+}
+
+fn debug_configuration(
+    projects: &Entity<DotnetProjects>,
+    configuration: RunConfiguration,
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let scenario = projects
+        .read(cx)
+        .project(&configuration.project_path)
+        .context("the project is no longer part of this workspace")
+        .and_then(|project| debug::debug_scenario(&configuration, project));
+    match scenario {
+        Ok(scenario) => {
+            let worktree_id = workspace
+                .project()
+                .read(cx)
+                .find_worktree(&configuration.project_path, cx)
+                .map(|(worktree, _)| worktree.read(cx).id());
+            workspace.start_debug_session(
+                scenario,
+                SharedTaskContext::default(),
+                None,
+                worktree_id,
+                window,
+                cx,
+            );
+        }
+        Err(error) => workspace.show_error(error, cx),
+    }
+}
+
 fn build_project(
     projects: &Entity<DotnetProjects>,
     window: &mut Window,
@@ -159,6 +217,69 @@ fn build_solution(
         }
     });
     spawn_plan(plan, window, cx);
+}
+
+/// Returns the .NET project model `register` created for `workspace`.
+pub fn workspace_projects(workspace: &Workspace, cx: &App) -> Option<Entity<DotnetProjects>> {
+    workspace
+        .status_bar()
+        .read(cx)
+        .item_of_type::<RunConfigurationIndicator>()
+        .map(|indicator| indicator.read(cx).projects.clone())
+}
+
+/// Builds, rebuilds or cleans a project or solution, with MSBuild.exe for legacy projects.
+pub fn build_target(
+    projects: &Entity<DotnetProjects>,
+    target: PathBuf,
+    verb: BuildVerb,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let plan = projects.update(cx, |projects, cx| projects.build_plan(target, verb, cx));
+    spawn_plan(plan, window, cx);
+}
+
+/// Runs a project's tests with `dotnet test`.
+pub fn test_project(
+    projects: &Entity<DotnetProjects>,
+    project_path: PathBuf,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let plan = match projects.read(cx).project(&project_path) {
+        Some(project) if project.style == ProjectStyle::Sdk => Ok(CommandPlan {
+            label: format!("Test {}", project.name),
+            source_path: project.path.clone(),
+            steps: vec![CommandLine {
+                program: "dotnet".into(),
+                args: vec!["test".into(), project.path.to_string_lossy().into_owned()],
+            }],
+            cwd: project.directory().to_path_buf(),
+        }),
+        Some(project) => Err(anyhow!(
+            "{} is a legacy project; run its tests with vstest.console.exe",
+            project.name
+        )),
+        None => Err(anyhow!("{} is not a .NET project", project_path.display())),
+    };
+    spawn_plan(Task::ready(plan), window, cx);
+}
+
+/// Runs `configuration`, or starts it under the debugger.
+pub fn start_run_configuration(
+    projects: &Entity<DotnetProjects>,
+    configuration: RunConfiguration,
+    debug: bool,
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    if debug {
+        debug_configuration(projects, configuration, workspace, window, cx);
+    } else {
+        run_configuration(projects, configuration, window, cx);
+    }
 }
 
 /// The .NET solutions and projects found in a workspace's worktrees.
@@ -207,6 +328,14 @@ impl DotnetProjects {
 
     pub fn run_configurations(&self) -> &[RunConfiguration] {
         &self.run_configurations
+    }
+
+    pub fn solutions(&self) -> &[Solution] {
+        &self.solutions
+    }
+
+    pub fn projects(&self) -> &[MsBuildProject] {
+        &self.projects
     }
 
     pub fn active_run_configuration(&self) -> Option<&RunConfiguration> {
@@ -543,9 +672,9 @@ fn affects_project_model(path: &RelPath) -> bool {
     let path = path.as_std_path();
     is_project_file(path)
         || is_solution_file(path)
-        || path
-            .file_name()
-            .is_some_and(|file_name| file_name == "launchSettings.json")
+        || path.file_name().is_some_and(|file_name| {
+            file_name == "launchSettings.json" || file_name == PACKAGES_CONFIG
+        })
 }
 
 async fn load_project_model(
@@ -575,6 +704,18 @@ async fn load_project_model(
             .log_err()
         {
             project.launch_profiles = load_launch_profiles(fs, &project).await;
+            let packages_config = project.directory().join(PACKAGES_CONFIG);
+            if fs.is_file(&packages_config).await
+                && let Some(packages) = fs
+                    .load(&packages_config)
+                    .await
+                    .and_then(|contents| parse_packages_config(&contents))
+                    .with_context(|| format!("reading {}", packages_config.display()))
+                    .log_err()
+            {
+                project.package_references = packages;
+                project.uses_packages_config = true;
+            }
             projects.push(project);
         }
     }
@@ -846,7 +987,22 @@ impl Render for RunConfigurationIndicator {
                                 .log_err();
                         }))
                         .tooltip(Tooltip::for_action_title("Run", &Run)),
-                ),
+                )
+                .when(configuration.can_debug(), |this| {
+                    this.child(
+                        IconButton::new("dotnet-debug", IconName::Debug)
+                            .icon_size(IconSize::Small)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let projects = this.projects.clone();
+                                this.workspace
+                                    .update(cx, |workspace, cx| {
+                                        debug(&projects, workspace, window, cx)
+                                    })
+                                    .log_err();
+                            }))
+                            .tooltip(Tooltip::for_action_title("Debug", &Debug)),
+                    )
+                }),
         )
     }
 }

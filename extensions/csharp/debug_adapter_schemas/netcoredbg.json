@@ -1,0 +1,51 @@
+{
+  "type": "object",
+  "required": ["request"],
+  "properties": {
+    "request": {
+      "type": "string",
+      "enum": ["launch", "attach"],
+      "description": "Whether to launch a new process or attach to a running one."
+    },
+    "program": {
+      "type": "string",
+      "description": "Path to the application assembly (.dll) or apphost executable to launch."
+    },
+    "args": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Command line arguments passed to the program.",
+      "default": []
+    },
+    "cwd": {
+      "type": "string",
+      "description": "Working directory of the program.",
+      "default": "${ZED_WORKTREE_ROOT}"
+    },
+    "env": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "Environment variables for the program, for example ASPNETCORE_ENVIRONMENT.",
+      "default": {}
+    },
+    "stopAtEntry": {
+      "type": "boolean",
+      "description": "Stop at the program's entry point.",
+      "default": false
+    },
+    "justMyCode": {
+      "type": "boolean",
+      "description": "Only step through and break in user code.",
+      "default": true
+    },
+    "enableStepFiltering": {
+      "type": "boolean",
+      "description": "Step over properties and operators.",
+      "default": true
+    },
+    "processId": {
+      "type": ["integer", "string"],
+      "description": "Process ID to attach to."
+    }
+  }
+}

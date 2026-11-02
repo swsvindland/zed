@@ -5188,6 +5188,9 @@ name = "dotnet"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "collections",
+ "dap",
  "db",
  "editor",
  "fs",
@@ -5212,6 +5215,25 @@ dependencies = [
  "url",
  "util",
  "which",
+ "workspace",
+]
+
+[[package]]
+name = "dotnet_ui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "collections",
+ "dotnet",
+ "editor",
+ "futures 0.3.34",
+ "gpui",
+ "http_client",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "ui",
+ "util",
  "workspace",
 ]
 
@@ -22658,6 +22680,7 @@ dependencies = [
  "dev_container",
  "diagnostics",
  "dotnet",
+ "dotnet_ui",
  "edit_prediction",
  "edit_prediction_ui",
  "editor",
@@ -22920,6 +22943,13 @@ dependencies = [
  "paths",
  "release_channel",
  "serde_json",
+]
+
+[[package]]
+name = "zed_csharp"
+version = "0.1.0"
+dependencies = [
+ "zed_extension_api 0.7.0",
 ]
 
 [[package]]

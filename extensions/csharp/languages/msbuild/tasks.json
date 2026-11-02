@@ -1,0 +1,32 @@
+[
+  {
+    "label": "dotnet build $ZED_STEM",
+    "command": "dotnet",
+    "args": ["build", "$ZED_FILE"],
+    "cwd": "$ZED_DIRNAME"
+  },
+  {
+    "label": "dotnet run --project $ZED_STEM",
+    "command": "dotnet",
+    "args": ["run", "--project", "$ZED_FILE"],
+    "cwd": "$ZED_DIRNAME"
+  },
+  {
+    "label": "dotnet test $ZED_STEM",
+    "command": "dotnet",
+    "args": ["test", "$ZED_FILE"],
+    "cwd": "$ZED_DIRNAME"
+  },
+  {
+    "label": "dotnet restore $ZED_STEM",
+    "command": "dotnet",
+    "args": ["restore", "$ZED_FILE"],
+    "cwd": "$ZED_DIRNAME"
+  },
+  {
+    "label": "dotnet clean $ZED_STEM",
+    "command": "dotnet",
+    "args": ["clean", "$ZED_FILE"],
+    "cwd": "$ZED_DIRNAME"
+  }
+]

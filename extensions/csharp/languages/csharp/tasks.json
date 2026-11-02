@@ -1,0 +1,49 @@
+[
+  {
+    "label": "dotnet run",
+    "command": "dotnet",
+    "args": ["run"],
+    "cwd": "$ZED_DIRNAME",
+    "tags": ["csharp-main"]
+  },
+  {
+    "label": "dotnet test --filter $ZED_CUSTOM_csharp_class_name.$ZED_CUSTOM_csharp_method_name",
+    "command": "dotnet",
+    "args": [
+      "test",
+      "--filter",
+      "FullyQualifiedName~$ZED_CUSTOM_csharp_class_name.$ZED_CUSTOM_csharp_method_name"
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "tags": ["csharp-test"]
+  },
+  {
+    "label": "dotnet test --filter $ZED_CUSTOM_csharp_class_name",
+    "command": "dotnet",
+    "args": [
+      "test",
+      "--filter",
+      "FullyQualifiedName~$ZED_CUSTOM_csharp_class_name"
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "tags": ["csharp-test-class"]
+  },
+  {
+    "label": "dotnet build (workspace)",
+    "command": "dotnet",
+    "args": ["build"],
+    "cwd": "$ZED_WORKTREE_ROOT"
+  },
+  {
+    "label": "dotnet test (workspace)",
+    "command": "dotnet",
+    "args": ["test"],
+    "cwd": "$ZED_WORKTREE_ROOT"
+  },
+  {
+    "label": "dotnet watch run",
+    "command": "dotnet",
+    "args": ["watch", "run"],
+    "cwd": "$ZED_DIRNAME"
+  }
+]
