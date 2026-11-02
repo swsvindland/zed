@@ -260,6 +260,7 @@ members = [
     # Extensions
     #
 
+    "extensions/csharp",
     "extensions/glsl",
     "extensions/html",
     "extensions/proto",

@@ -63,6 +63,19 @@ pub struct MsBuildProject {
     /// The files a legacy project lists, relative to the project directory and possibly containing
     /// wildcards. SDK-style projects include the files in their directory instead.
     pub items: Option<Vec<String>>,
+    /// Absolute paths of the projects this project references.
+    pub project_references: Vec<PathBuf>,
+    /// `PackageReference` items, or the contents of `packages.config` when `uses_packages_config`.
+    pub package_references: Vec<PackageReference>,
+    pub uses_packages_config: bool,
+    pub is_test_project: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackageReference {
+    pub id: String,
+    /// `None` when the version comes from elsewhere, such as central package management.
+    pub version: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -231,6 +244,44 @@ pub fn parse_project(path: &Path, contents: &str) -> Result<MsBuildProject> {
     })
     .collect();
 
+    let directory = path.parent().unwrap_or(Path::new(""));
+    let item_groups = || {
+        root.children_named("ItemGroup")
+            .flat_map(|group| &group.children)
+    };
+    let project_references = item_groups()
+        .filter(|item| item.name == "ProjectReference")
+        .filter_map(|item| item.attribute("Include"))
+        .filter(|include| !include.contains("$("))
+        .map(|include| resolve_msbuild_path(directory, &unescape_msbuild(include.trim())))
+        .collect();
+    let package_references = item_groups()
+        .filter(|item| item.name == "PackageReference")
+        .filter_map(|item| {
+            let id = item.attribute("Include")?.trim().to_owned();
+            let version = item
+                .attribute("Version")
+                .or_else(|| item.attribute("VersionOverride"))
+                .map(str::to_owned)
+                .or_else(|| {
+                    item.child("Version")
+                        .map(|version| version.text.trim().to_owned())
+                })
+                .filter(|version| !version.is_empty());
+            Some(PackageReference { id, version })
+        })
+        .collect::<Vec<PackageReference>>();
+    let is_test_project = unconditional_property(root, "IsTestProject")
+        .map(|value| value.eq_ignore_ascii_case("true"))
+        .unwrap_or_else(|| {
+            package_references.iter().any(|package| {
+                package.id.eq_ignore_ascii_case("Microsoft.NET.Test.Sdk")
+                    || package.id.eq_ignore_ascii_case("MSTest.Sdk")
+            }) || sdk
+                .as_deref()
+                .is_some_and(|sdk| sdk.starts_with("MSTest.Sdk"))
+        });
+
     Ok(MsBuildProject {
         path: path.to_path_buf(),
         name,
@@ -243,7 +294,28 @@ pub fn parse_project(path: &Path, contents: &str) -> Result<MsBuildProject> {
         launch_profiles: Vec::new(),
         output_directories,
         items,
+        project_references,
+        package_references,
+        uses_packages_config: false,
+        is_test_project,
     })
+}
+
+/// Parses a legacy project's `packages.config`.
+pub fn parse_packages_config(contents: &str) -> Result<Vec<PackageReference>> {
+    let document = parse_xml(contents)?;
+    let packages = document
+        .child("packages")
+        .context("packages.config has no <packages> element")?;
+    Ok(packages
+        .children_named("package")
+        .filter_map(|package| {
+            Some(PackageReference {
+                id: package.attribute("id")?.to_owned(),
+                version: package.attribute("version").map(str::to_owned),
+            })
+        })
+        .collect())
 }
 
 fn item_includes(root: &XmlElement) -> Vec<String> {
@@ -382,6 +454,112 @@ pub fn parse_launch_settings(contents: &str) -> Result<Vec<String>> {
         })
         .map(|(name, _)| name)
         .collect())
+}
+
+/// What a `launchSettings.json` profile asks `dotnet run` to set up for the program.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LaunchProfile {
+    pub name: String,
+    pub command_line_args: Option<String>,
+    pub working_directory: Option<String>,
+    pub application_url: Option<String>,
+    pub environment_variables: Vec<(String, String)>,
+}
+
+/// Returns the profile `dotnet run` would use: `name`, or else the first `Project` profile.
+pub fn parse_launch_profile(contents: &str, name: Option<&str>) -> Result<Option<LaunchProfile>> {
+    #[derive(Deserialize)]
+    struct LaunchSettings {
+        #[serde(default)]
+        profiles: serde_json::Map<String, serde_json::Value>,
+    }
+
+    let launch_settings: LaunchSettings =
+        serde_json_lenient::from_str(contents.trim_start_matches('\u{feff}'))?;
+    let profile = launch_settings
+        .profiles
+        .into_iter()
+        .find(|(profile_name, profile)| {
+            let is_project = profile
+                .get("commandName")
+                .and_then(|command_name| command_name.as_str())
+                .is_some_and(|command_name| command_name == "Project");
+            match name {
+                Some(name) => profile_name == name,
+                None => is_project,
+            }
+        });
+    let Some((name, profile)) = profile else {
+        return Ok(None);
+    };
+
+    let string = |key: &str| {
+        profile
+            .get(key)
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    let environment_variables = profile
+        .get("environmentVariables")
+        .and_then(|variables| variables.as_object())
+        .map(|variables| {
+            variables
+                .iter()
+                .filter_map(|(key, value)| Some((key.clone(), value.as_str()?.to_owned())))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(Some(LaunchProfile {
+        command_line_args: string("commandLineArgs"),
+        working_directory: string("workingDirectory"),
+        application_url: string("applicationUrl"),
+        environment_variables,
+        name,
+    }))
+}
+
+/// Splits a `commandLineArgs` value the way the .NET runtime splits a Windows command line.
+pub fn split_command_line(command_line: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut has_arg = false;
+    let mut backslashes = 0;
+    for character in command_line.chars() {
+        match character {
+            '\\' => {
+                backslashes += 1;
+                continue;
+            }
+            '"' => {
+                current.extend(std::iter::repeat_n('\\', backslashes / 2));
+                if backslashes % 2 == 1 {
+                    current.push('"');
+                } else {
+                    in_quotes = !in_quotes;
+                    has_arg = true;
+                }
+            }
+            character if character.is_whitespace() && !in_quotes => {
+                current.extend(std::iter::repeat_n('\\', backslashes));
+                if has_arg || !current.is_empty() {
+                    args.push(std::mem::take(&mut current));
+                }
+                has_arg = false;
+            }
+            character => {
+                current.extend(std::iter::repeat_n('\\', backslashes));
+                current.push(character);
+            }
+        }
+        backslashes = 0;
+    }
+    current.extend(std::iter::repeat_n('\\', backslashes));
+    if has_arg || !current.is_empty() {
+        args.push(current);
+    }
+    args
 }
 
 pub fn parse_solution(path: &Path, contents: &str) -> Result<Solution> {
@@ -526,6 +704,16 @@ pub enum RunKind {
 }
 
 impl RunConfiguration {
+    /// Whether netcoredbg can debug this configuration; it can't debug the .NET Framework.
+    pub fn can_debug(&self) -> bool {
+        match &self.kind {
+            RunKind::DotnetRun { framework, .. } => {
+                !framework.as_deref().is_some_and(is_net_framework)
+            }
+            RunKind::Executable | RunKind::IisExpress => false,
+        }
+    }
+
     pub fn label(&self) -> String {
         let details = match &self.kind {
             RunKind::DotnetRun {
@@ -980,6 +1168,10 @@ mod tests {
                 launch_profiles: Vec::new(),
                 output_directories: vec!["bin\\".into(), "obj\\".into()],
                 items: Some(vec!["Global.asax.cs".into()]),
+                project_references: Vec::new(),
+                package_references: Vec::new(),
+                uses_packages_config: false,
+                is_test_project: false,
             }
         );
         assert_eq!(

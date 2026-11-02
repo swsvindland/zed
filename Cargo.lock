@@ -5188,6 +5188,9 @@ name = "dotnet"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "collections",
+ "dap",
  "db",
  "editor",
  "fs",
@@ -22920,6 +22923,13 @@ dependencies = [
  "paths",
  "release_channel",
  "serde_json",
+]
+
+[[package]]
+name = "zed_csharp"
+version = "0.1.0"
+dependencies = [
+ "zed_extension_api 0.7.0",
 ]
 
 [[package]]
