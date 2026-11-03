@@ -498,6 +498,8 @@ impl InlayHintSettings {
 /// or [Supermaven](https://supermaven.com).
 #[derive(Clone, Debug, Default)]
 pub struct EditPredictionSettings {
+    /// Whether to show the edit prediction button in the status bar.
+    pub button: bool,
     /// The provider that supplies edit predictions.
     pub provider: settings::EditPredictionProvider,
     /// Disable edit predictions for files matching these glob patterns.
@@ -1032,6 +1034,7 @@ impl settings::Settings for AllLanguageSettings {
 
         Self {
             edit_predictions: EditPredictionSettings {
+                button: edit_predictions.button.unwrap(),
                 provider: if let Some(provider) = edit_prediction_provider {
                     provider
                 } else {

@@ -16,9 +16,9 @@ use crate::repository::{
     AskPassDelegate, Branch, BranchesScanResult, CommitData, CommitDataReader, CommitDetails,
     CommitDiff, CommitFile, CommitOptions, CommitSummary, CreateWorktreeTarget, DiffStatType,
     DiffType, FetchOptions, FileHistoryChangedFileSets, GitCommitTemplate, GitRepository,
-    GitRepositoryCheckpoint, InitialGraphCommitData, LogOrder, LogSource, PushOptions,
-    REMOTE_CANCELLED_BY_USER, Remote, RemoteCommandOutput, RepoPath, ResetMode, SearchCommitArgs,
-    Upstream, UpstreamTracking, UpstreamTrackingStatus, Worktree,
+    InitialGraphCommitData, LogOrder, LogSource, PushOptions, REMOTE_CANCELLED_BY_USER, Remote,
+    RemoteCommandOutput, RepoPath, ResetMode, SearchCommitArgs, Upstream, UpstreamTracking,
+    UpstreamTrackingStatus, Worktree,
 };
 use crate::stash::GitStash;
 use crate::status::{
@@ -468,11 +468,12 @@ impl SvnBinary {
     }
 
     /// Runs a command that talks to the server, asking for credentials when Subversion
-    /// doesn't have any cached and retrying once with them.
+    /// doesn't have any cached and retrying once with them. Without an askpass delegate
+    /// (a background fetch), it never prompts and returns the first attempt's output.
     async fn run_with_credentials(
         &self,
         args: Vec<OsString>,
-        askpass: &AskPassDelegate,
+        askpass: Option<&AskPassDelegate>,
         env: &HashMap<String, String>,
     ) -> Result<Output> {
         let output = self
@@ -489,6 +490,9 @@ impl SvnBinary {
         {
             return Ok(output);
         }
+        let Some(askpass) = askpass else {
+            return Ok(output);
+        };
 
         let server = self
             .run(["info", "--show-item", "repos-root-url"])
@@ -1356,7 +1360,7 @@ impl GitRepository for SvnRepository {
                         "--targets".into(),
                         targets_file.path().into(),
                     ],
-                    &askpass,
+                    Some(&askpass),
                     &env,
                 )
                 .await?;
@@ -1464,7 +1468,7 @@ impl GitRepository for SvnRepository {
         let state = self.state.clone();
         async move {
             let output = svn
-                .run_with_credentials(vec!["update".into()], &askpass, &env)
+                .run_with_credentials(vec!["update".into()], Some(&askpass), &env)
                 .await?;
             check_output(&output)?;
             let mut state = state.lock();
@@ -1481,7 +1485,7 @@ impl GitRepository for SvnRepository {
     fn fetch(
         &self,
         _fetch_options: FetchOptions,
-        askpass: AskPassDelegate,
+        askpass: Option<AskPassDelegate>,
         env: Arc<HashMap<String, String>>,
         _cx: AsyncApp,
     ) -> BoxFuture<'_, Result<RemoteCommandOutput>> {
@@ -1499,7 +1503,7 @@ impl GitRepository for SvnRepository {
                         "BASE:HEAD".into(),
                         ".".into(),
                     ],
-                    &askpass,
+                    askpass.as_ref(),
                     &env,
                 )
                 .await?;
@@ -1614,17 +1618,6 @@ impl GitRepository for SvnRepository {
             .boxed()
     }
 
-    fn checkpoint(&self) -> BoxFuture<'static, Result<GitRepositoryCheckpoint>> {
-        self.unsupported("Checkpoints")
-    }
-
-    fn restore_checkpoint(
-        &self,
-        _checkpoint: GitRepositoryCheckpoint,
-    ) -> BoxFuture<'_, Result<()>> {
-        self.unsupported("Checkpoints")
-    }
-
     fn create_archive_checkpoint(&self) -> BoxFuture<'_, Result<(String, String)>> {
         self.unsupported("Checkpoints")
     }
@@ -1634,22 +1627,6 @@ impl GitRepository for SvnRepository {
         _staged_sha: String,
         _unstaged_sha: String,
     ) -> BoxFuture<'_, Result<()>> {
-        self.unsupported("Checkpoints")
-    }
-
-    fn compare_checkpoints(
-        &self,
-        _left: GitRepositoryCheckpoint,
-        _right: GitRepositoryCheckpoint,
-    ) -> BoxFuture<'_, Result<bool>> {
-        self.unsupported("Checkpoints")
-    }
-
-    fn diff_checkpoints(
-        &self,
-        _base_checkpoint: GitRepositoryCheckpoint,
-        _target_checkpoint: GitRepositoryCheckpoint,
-    ) -> BoxFuture<'_, Result<String>> {
         self.unsupported("Checkpoints")
     }
 
@@ -4076,7 +4053,12 @@ Cannot display: file marked as a binary type.
 
         assert_eq!(behind(&repository).await, 0);
         let output = repository
-            .fetch(FetchOptions::All, askpass(cx), env.clone(), cx.to_async())
+            .fetch(
+                FetchOptions::All,
+                Some(askpass(cx)),
+                env.clone(),
+                cx.to_async(),
+            )
             .await
             .unwrap();
         assert_eq!(output.stdout, "1 new revision on the server.");
