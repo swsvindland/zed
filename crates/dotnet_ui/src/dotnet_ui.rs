@@ -6,4 +6,4 @@ mod nuget_panel;
 mod solution_explorer;
 
 pub use nuget_panel::NuGetPanel;
-pub use solution_explorer::SolutionExplorer;
+pub use solution_explorer::{OpenSolution, SolutionExplorer};

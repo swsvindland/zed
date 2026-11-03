@@ -129,6 +129,14 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                     },
                     workspace::Open::default(),
                 ),
+                MenuItem::action(
+                    if cfg!(not(target_os = "macos")) {
+                        "Open Solution..."
+                    } else {
+                        "Open Solution…"
+                    },
+                    dotnet_ui::OpenSolution,
+                ),
                 MenuItem::action("Open Recent…", zed_actions::OpenRecent::default()),
                 MenuItem::action("Open Remote…", zed_actions::OpenRemote::default()),
                 MenuItem::separator(),
