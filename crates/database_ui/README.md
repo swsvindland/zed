@@ -12,6 +12,9 @@ Environments are colored (dev green, qa yellow, prod red) and connected servers 
   Windows or password authentication, databases to show (empty shows all), default database,
   encryption and certificate trust, and a production override. **Test Connection** checks it.
   Passwords go to the OS credential store, never the JSON file.
+- Expanded connections and databases show a badge such as **5 of 19**. Click it (or right-click
+  and pick **Choose Databases…** / **Choose Schemas…**) for a checklist of what the server has;
+  the choice is applied when the list closes and saved to the profile (`databases`, `schemas`).
 - The gear opens `database_connections.json` for hand editing; the refresh button reloads it.
 - Right-click a connection or database for **New Query Console**, **Use for Current Editor**,
   **Edit Connection…**, **Disconnect** and **Delete Connection**. Double-click a table (or use

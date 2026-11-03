@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use anyhow::{Context as _, Result};
 use gpui::AsyncApp;
@@ -96,6 +96,10 @@ pub struct ConnectionProfile {
     /// Databases shown under this connection. Empty shows every database on the server.
     #[serde(default)]
     pub databases: Vec<String>,
+    /// Schemas shown under each database, keyed by database. A database without an entry shows
+    /// every schema.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub schemas: BTreeMap<String, Vec<String>>,
     /// Database used for server-level queries such as listing databases.
     #[serde(default)]
     pub default_database: Option<String>,
@@ -127,6 +131,7 @@ impl ConnectionProfile {
             },
             username: None,
             databases: Vec::new(),
+            schemas: BTreeMap::new(),
             default_database: None,
             encrypt: true,
             trust_server_certificate: false,
@@ -148,6 +153,14 @@ impl ConnectionProfile {
 
     pub fn needs_password(&self) -> bool {
         self.authentication == Authentication::Password
+    }
+
+    /// The schemas chosen for `database`, or `None` when every schema is shown.
+    pub fn schema_filter(&self, database: &str) -> Option<&[String]> {
+        self.schemas
+            .get(database)
+            .filter(|schemas| !schemas.is_empty())
+            .map(Vec::as_slice)
     }
 }
 

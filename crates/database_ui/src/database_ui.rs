@@ -77,6 +77,9 @@ pub fn init(cx: &mut App) {
 #[derive(Clone, Debug)]
 pub enum DatabaseStoreEvent {
     ConnectionsChanged,
+    /// Only the databases or schemas a connection shows changed; sessions and loaded metadata
+    /// are still valid.
+    FiltersChanged,
 }
 
 /// Connection profiles, cached passwords and live sessions, shared by every window.
@@ -88,6 +91,9 @@ pub struct DatabaseStore {
     passwords: HashMap<String, String>,
     /// Databases seen while browsing each connection, offered when picking a console target.
     known_databases: HashMap<String, Vec<String>>,
+    /// Whether changes are written to the connections file. Off for connections injected by
+    /// tests, so they never overwrite the user's file.
+    persist: bool,
 }
 
 struct GlobalDatabaseStore(Entity<DatabaseStore>);
@@ -108,6 +114,7 @@ impl DatabaseStore {
                 pool: Arc::default(),
                 passwords: HashMap::default(),
                 known_databases: HashMap::default(),
+                persist: true,
             };
             store.reload(cx);
             store
@@ -184,14 +191,17 @@ impl DatabaseStore {
         }
         self.pool.discard_connection(&profile.id);
         self.passwords.remove(&profile.id);
+        let persist = self.persist;
         cx.spawn(async move |this, cx| {
             if let Some(password) = &password {
                 database::write_password(&profile, password, cx)
                     .await
                     .context("storing the password in the credential store")?;
             }
-            let saved = connections.clone();
-            cx.background_spawn(async move { saved.save() }).await?;
+            if persist {
+                let saved = connections.clone();
+                cx.background_spawn(async move { saved.save() }).await?;
+            }
             this.update(cx, |this, cx| {
                 this.connections = connections;
                 this.load_error = None;
@@ -199,6 +209,36 @@ impl DatabaseStore {
                 cx.notify();
             })
         })
+    }
+
+    /// Changes which databases or schemas a connection shows. Unlike [`Self::save_profile`],
+    /// open sessions are kept.
+    pub fn update_filters(
+        &mut self,
+        connection_id: &str,
+        update: impl FnOnce(&mut ConnectionProfile),
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let Some(profile) = self
+            .connections
+            .connections
+            .iter_mut()
+            .find(|profile| profile.id == connection_id)
+        else {
+            return Task::ready(Ok(()));
+        };
+        let previous = profile.clone();
+        update(profile);
+        if *profile == previous {
+            return Task::ready(Ok(()));
+        }
+        cx.emit(DatabaseStoreEvent::FiltersChanged);
+        cx.notify();
+        if !self.persist {
+            return Task::ready(Ok(()));
+        }
+        let connections = self.connections.clone();
+        cx.background_spawn(async move { connections.save() })
     }
 
     pub fn delete_profile(
@@ -215,12 +255,15 @@ impl DatabaseStore {
             .retain(|existing| existing.id != connection_id);
         self.pool.discard_connection(connection_id);
         self.passwords.remove(connection_id);
+        let persist = self.persist;
         cx.spawn(async move |this, cx| {
             if profile.needs_password() {
                 database::delete_password(&profile, cx).await.log_err();
             }
-            let saved = connections.clone();
-            cx.background_spawn(async move { saved.save() }).await?;
+            if persist {
+                let saved = connections.clone();
+                cx.background_spawn(async move { saved.save() }).await?;
+            }
             this.update(cx, |this, cx| {
                 this.connections = connections;
                 cx.emit(DatabaseStoreEvent::ConnectionsChanged);
@@ -328,6 +371,7 @@ impl DatabaseStore {
         connections: ConnectionsFile,
         cx: &mut Context<Self>,
     ) {
+        self.persist = false;
         self.connections = connections;
         cx.emit(DatabaseStoreEvent::ConnectionsChanged);
         cx.notify();

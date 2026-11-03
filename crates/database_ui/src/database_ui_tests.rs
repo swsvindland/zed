@@ -16,6 +16,7 @@ use workspace::{AppState, MultiWorkspace, Workspace};
 use crate::{
     DatabasePanel, DatabaseStore, RunStatement,
     console::{self, ConsoleTarget},
+    database_panel::NodeKey,
     push_modal::PushReviewModal,
     results_view::QueryResultsView,
 };
@@ -142,6 +143,15 @@ async fn test_browse_query_edit_and_push(cx: &mut TestAppContext) {
         cx,
     )
     .await;
+    run_sql(
+        &store,
+        setup.clone(),
+        "IF SCHEMA_ID('zed_other') IS NULL EXEC('CREATE SCHEMA zed_other');\n\
+         DROP TABLE IF EXISTS zed_other.Notes;\n\
+         CREATE TABLE zed_other.Notes (Id int PRIMARY KEY)",
+        cx,
+    )
+    .await;
 
     // Phase 1: the panel lists environments and, once expanded, the server's databases.
     let panel = workspace
@@ -165,6 +175,73 @@ async fn test_browse_query_edit_and_push(cx: &mut TestAppContext) {
         let labels = panel.visible_labels();
         assert!(labels.iter().any(|label| label == "dev"), "{labels:?}");
         assert!(labels.iter().any(|label| label == "prod"), "{labels:?}");
+        assert!(labels.iter().any(|label| label == "master"), "{labels:?}");
+    });
+
+    // Phase 1b: choosing databases and schemas narrows the tree, and the badges count them.
+    let connection = NodeKey::Connection {
+        connection_id: dev.id.clone(),
+    };
+    let database = NodeKey::Database {
+        connection_id: dev.id.clone(),
+        database: DATABASE.into(),
+    };
+    let total = panel.read_with(cx, |panel, cx| {
+        let badge = panel.badge_for_test(&connection, cx).unwrap();
+        let (shown, total) = badge.split_once(" of ").unwrap();
+        assert_eq!(shown, total, "nothing is filtered yet");
+        total.to_string()
+    });
+    panel.update_in(cx, |panel, window, cx| {
+        panel.open_and_close_picker_for_test(connection.clone(), window, cx)
+    });
+    cx.run_until_parked();
+    panel.read_with(cx, |panel, cx| {
+        assert!(panel.visible_labels().iter().any(|label| label == "master"));
+        assert_eq!(
+            panel.badge_for_test(&connection, cx),
+            Some(format!("{total} of {total}")),
+            "closing the picker unchanged keeps every database"
+        );
+    });
+    panel.update(cx, |panel, cx| {
+        panel.choose_for_test(connection.clone(), &[DATABASE], cx);
+        panel.expand_for_test(database.clone(), cx);
+    });
+    wait_until(cx, "schemas in the panel", |cx| {
+        panel.read_with(cx, |panel, _| {
+            panel.visible_labels().iter().any(|label| label == "dbo")
+        })
+    })
+    .await;
+    panel.read_with(cx, |panel, cx| {
+        let labels = panel.visible_labels();
+        assert!(labels.iter().any(|label| label == DATABASE), "{labels:?}");
+        assert!(!labels.iter().any(|label| label == "master"), "{labels:?}");
+        assert_eq!(
+            panel.badge_for_test(&connection, cx),
+            Some(format!("1 of {total}"))
+        );
+    });
+    panel.update(cx, |panel, cx| {
+        panel.choose_for_test(database.clone(), &["zed_other"], cx)
+    });
+    panel.read_with(cx, |panel, cx| {
+        let labels = panel.visible_labels();
+        assert!(!labels.iter().any(|label| label == "dbo"), "{labels:?}");
+        assert!(
+            labels.iter().any(|label| label == "zed_other"),
+            "{labels:?}"
+        );
+        assert_eq!(panel.badge_for_test(&database, cx), Some("1 of 2".into()));
+    });
+    panel.update(cx, |panel, cx| {
+        panel.choose_for_test(database.clone(), &[], cx);
+        panel.choose_for_test(connection.clone(), &[], cx);
+    });
+    panel.read_with(cx, |panel, _| {
+        let labels = panel.visible_labels();
+        assert!(labels.iter().any(|label| label == "dbo"), "{labels:?}");
         assert!(labels.iter().any(|label| label == "master"), "{labels:?}");
     });
 

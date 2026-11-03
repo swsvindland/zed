@@ -1,4 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    rc::Rc,
+};
 
 use anyhow::Result;
 use database::{
@@ -12,7 +16,7 @@ use gpui::{
     Render, SharedString, Subscription, Task, UniformListScrollHandle, WeakEntity, Window,
     anchored, deferred, px, uniform_list,
 };
-use ui::{ContextMenu, IconButton, IconSize, ListItem, Tooltip, prelude::*};
+use ui::{ButtonSize, ContextMenu, IconButton, IconSize, ListItem, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::{
     OpenOptions, OpenVisible, Workspace,
@@ -116,7 +120,32 @@ struct Entry {
 struct DeployedContextMenu {
     menu: Entity<ContextMenu>,
     position: Point<Pixels>,
-    _subscription: Subscription,
+    /// Runs once when the menu closes, however it closes; pickers apply their choices here.
+    on_close: Option<Box<dyn FnOnce(&mut DatabasePanel, &mut Context<DatabasePanel>)>>,
+    _subscriptions: Vec<Subscription>,
+}
+
+/// What a database or schema picker can offer.
+struct FilterOptions {
+    names: Vec<String>,
+    /// The names currently chosen; empty when everything is shown.
+    chosen: Vec<String>,
+    /// How many names the server listed, once it has.
+    total: Option<usize>,
+    status: FilterStatus,
+}
+
+#[derive(PartialEq)]
+enum FilterStatus {
+    Loading,
+    Loaded,
+    Failed(SharedString),
+}
+
+/// The choices in an open picker, applied when it closes.
+struct FilterChoice {
+    all: bool,
+    chosen: HashSet<String>,
 }
 
 pub struct DatabasePanel {
@@ -152,6 +181,7 @@ impl DatabasePanel {
                     this.children.clear();
                     this.rebuild_entries(cx);
                 }
+                DatabaseStoreEvent::FiltersChanged => this.rebuild_entries(cx),
             }),
             cx.observe(&store, |_, _, cx| cx.notify()),
         ];
@@ -217,10 +247,11 @@ impl DatabasePanel {
                 });
                 if expanded {
                     if profile.databases.is_empty() {
-                        self.push_children(&key, 2, &mut entries);
+                        self.push_children(profile, &key, 2, &mut entries);
                     } else {
                         for database in &profile.databases {
                             self.push_node(
+                                profile,
                                 ChildNode {
                                     key: NodeKey::Database {
                                         connection_id: profile.id.clone(),
@@ -242,7 +273,13 @@ impl DatabasePanel {
         cx.notify();
     }
 
-    fn push_node(&self, node: ChildNode, depth: usize, entries: &mut Vec<Entry>) {
+    fn push_node(
+        &self,
+        profile: &ConnectionProfile,
+        node: ChildNode,
+        depth: usize,
+        entries: &mut Vec<Entry>,
+    ) {
         let expanded = !node.is_leaf && self.expanded.contains(&node.key);
         entries.push(Entry {
             depth,
@@ -254,11 +291,17 @@ impl DatabasePanel {
             },
         });
         if expanded {
-            self.push_children(&node.key, depth + 1, entries);
+            self.push_children(profile, &node.key, depth + 1, entries);
         }
     }
 
-    fn push_children(&self, key: &NodeKey, depth: usize, entries: &mut Vec<Entry>) {
+    fn push_children(
+        &self,
+        profile: &ConnectionProfile,
+        key: &NodeKey,
+        depth: usize,
+        entries: &mut Vec<Entry>,
+    ) {
         match self.children.get(key) {
             None | Some(Children::Loading(_)) => entries.push(Entry {
                 depth,
@@ -269,11 +312,250 @@ impl DatabasePanel {
                 kind: EntryKind::Error(error.clone()),
             }),
             Some(Children::Loaded(nodes)) => {
+                let schema_filter = match key {
+                    NodeKey::Database { database, .. } => profile.schema_filter(database),
+                    _ => None,
+                };
                 for node in nodes {
-                    self.push_node(node.clone(), depth, entries);
+                    if let (Some(chosen), NodeKey::Schema { schema, .. }) =
+                        (schema_filter, &node.key)
+                        && !chosen.contains(schema)
+                    {
+                        continue;
+                    }
+                    self.push_node(profile, node.clone(), depth, entries);
                 }
             }
         }
+    }
+
+    /// Names a database or schema picker offers for `key`: what the server listed, then any
+    /// chosen names it didn't list, so a choice is never silently dropped.
+    fn filter_options(&self, key: &NodeKey, cx: &App) -> FilterOptions {
+        let profile = key
+            .connection_id()
+            .and_then(|connection_id| self.store.read(cx).profile(connection_id));
+        let chosen = match (key, profile) {
+            (NodeKey::Connection { .. }, Some(profile)) => profile.databases.as_slice(),
+            (NodeKey::Database { database, .. }, Some(profile)) => {
+                profile.schema_filter(database).unwrap_or_default()
+            }
+            _ => &[],
+        };
+        let (mut names, status) = match self.children.get(key) {
+            Some(Children::Loaded(nodes)) => (
+                nodes
+                    .iter()
+                    .map(|node| node.label.to_string())
+                    .collect::<Vec<_>>(),
+                FilterStatus::Loaded,
+            ),
+            Some(Children::Failed(error)) => (Vec::new(), FilterStatus::Failed(error.clone())),
+            None | Some(Children::Loading(_)) => (Vec::new(), FilterStatus::Loading),
+        };
+        let total = (status == FilterStatus::Loaded).then_some(names.len());
+        for name in chosen {
+            if !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
+        FilterOptions {
+            names,
+            chosen: chosen.to_vec(),
+            total,
+            status,
+        }
+    }
+
+    /// "5 of 19" for a connection's databases or a database's schemas, once they're loaded.
+    fn filter_badge(&self, key: &NodeKey, cx: &App) -> Option<SharedString> {
+        if !matches!(key, NodeKey::Connection { .. } | NodeKey::Database { .. }) {
+            return None;
+        }
+        let options = self.filter_options(key, cx);
+        let total = options.total?;
+        let listed = &options.names[..total];
+        let shown = if options.chosen.is_empty() {
+            total
+        } else {
+            listed
+                .iter()
+                .filter(|name| options.chosen.contains(name))
+                .count()
+        };
+        Some(format!("{shown} of {total}").into())
+    }
+
+    fn deploy_filter_menu(
+        &mut self,
+        key: NodeKey,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (all_label, header) = match &key {
+            NodeKey::Connection { .. } => ("All databases", "Show databases".to_string()),
+            NodeKey::Database { database, .. } => {
+                ("All schemas", format!("Show schemas in {database}"))
+            }
+            _ => return,
+        };
+        self.selected = Some(key.clone());
+        if !matches!(
+            self.children.get(&key),
+            Some(Children::Loaded(_) | Children::Loading(_))
+        ) {
+            self.load_children(key.clone(), cx);
+        }
+
+        let initial = self.filter_options(&key, cx);
+        let mut was_loading = initial.status == FilterStatus::Loading;
+        let choice = Rc::new(RefCell::new(FilterChoice {
+            all: initial.chosen.is_empty(),
+            chosen: initial.chosen.iter().cloned().collect(),
+        }));
+        // The builder can't read the panel: its first run happens while the panel is updating.
+        let options = Rc::new(RefCell::new(initial));
+        let menu = ContextMenu::build_persistent(window, cx, {
+            let options = options.clone();
+            let choice = choice.clone();
+            move |mut menu, _, _| {
+                let options = options.borrow();
+                let names = Rc::new(options.names.clone());
+                let current = choice.borrow();
+                menu = menu.header(header.clone()).toggleable_entry(
+                    all_label,
+                    current.all,
+                    IconPosition::Start,
+                    None,
+                    {
+                        let choice = choice.clone();
+                        move |_, _| {
+                            let mut choice = choice.borrow_mut();
+                            choice.all = !choice.all;
+                            choice.chosen.clear();
+                        }
+                    },
+                );
+                menu = menu.separator();
+                match &options.status {
+                    FilterStatus::Loading => menu = menu.label("Loading…"),
+                    FilterStatus::Failed(error) => menu = menu.label(error.clone()),
+                    FilterStatus::Loaded => {}
+                }
+                for name in names.iter() {
+                    let checked = current.all || current.chosen.contains(name);
+                    let choice = choice.clone();
+                    let names = names.clone();
+                    let name = name.clone();
+                    menu = menu.toggleable_entry(
+                        name.clone(),
+                        checked,
+                        IconPosition::Start,
+                        None,
+                        move |_, _| {
+                            let mut choice = choice.borrow_mut();
+                            if choice.all {
+                                choice.all = false;
+                                choice.chosen = names.iter().cloned().collect();
+                            }
+                            if !choice.chosen.remove(&name) {
+                                choice.chosen.insert(name.clone());
+                            }
+                        },
+                    );
+                }
+                menu.separator().label("Click outside the list to apply")
+            }
+        });
+
+        // The names arrive after the menu opens when they weren't loaded yet.
+        let panel = cx.entity();
+        let refresh = menu.update(cx, |_, cx| {
+            let key = key.clone();
+            cx.observe_in(&panel, window, move |menu, panel, window, cx| {
+                let panel = panel.read(cx);
+                let is_loading = matches!(panel.children.get(&key), Some(Children::Loading(_)));
+                if was_loading && !is_loading {
+                    *options.borrow_mut() = panel.filter_options(&key, cx);
+                    menu.rebuild(window, cx);
+                }
+                was_loading = is_loading;
+            })
+        });
+        window.focus(&menu.focus_handle(cx), cx);
+        let dismiss = cx.subscribe(&menu, |this, _, _: &DismissEvent, cx| {
+            this.close_context_menu(cx);
+        });
+        self.show_context_menu(
+            DeployedContextMenu {
+                menu,
+                position,
+                on_close: Some(Box::new(move |this, cx| {
+                    this.apply_filter(&key, &choice.borrow(), cx);
+                })),
+                _subscriptions: vec![dismiss, refresh],
+            },
+            cx,
+        );
+    }
+
+    fn show_context_menu(&mut self, menu: DeployedContextMenu, cx: &mut Context<Self>) {
+        self.close_context_menu(cx);
+        self.context_menu = Some(menu);
+        cx.notify();
+    }
+
+    fn close_context_menu(&mut self, cx: &mut Context<Self>) {
+        if let Some(on_close) = self
+            .context_menu
+            .take()
+            .and_then(|mut menu| menu.on_close.take())
+        {
+            on_close(self, cx);
+        }
+        cx.notify();
+    }
+
+    fn apply_filter(&mut self, key: &NodeKey, choice: &FilterChoice, cx: &mut Context<Self>) {
+        let Some(connection_id) = key.connection_id().map(ToOwned::to_owned) else {
+            return;
+        };
+        // Keep the server's order; nothing chosen falls back to showing everything.
+        let chosen = if choice.all {
+            Vec::new()
+        } else {
+            self.filter_options(key, cx)
+                .names
+                .into_iter()
+                .filter(|name| choice.chosen.contains(name))
+                .collect::<Vec<_>>()
+        };
+        let database = key.database().map(ToOwned::to_owned);
+        let task = self.store.update(cx, |store, cx| {
+            store.update_filters(
+                &connection_id,
+                move |profile| match database {
+                    None => profile.databases = chosen,
+                    Some(database) if chosen.is_empty() => {
+                        profile.schemas.remove(&database);
+                    }
+                    Some(database) => {
+                        profile.schemas.insert(database, chosen);
+                    }
+                },
+                cx,
+            )
+        });
+        let workspace = self.workspace.clone();
+        cx.spawn(async move |_, cx| {
+            if let Err(error) = task.await {
+                workspace
+                    .update(cx, |workspace, cx| crate::show_error(workspace, &error, cx))
+                    .log_err();
+            }
+        })
+        .detach();
     }
 
     fn toggle_expanded(&mut self, key: &NodeKey, cx: &mut Context<Self>) {
@@ -496,6 +778,21 @@ impl DatabasePanel {
                         .log_err();
                 }
             };
+            let choose = {
+                let this = this.clone();
+                let key = key.clone();
+                move |window: &mut Window, cx: &mut App| {
+                    let this = this.clone();
+                    let key = key.clone();
+                    // Let this menu close first so the picker isn't dismissed with it.
+                    window.defer(cx, move |window, cx| {
+                        this.update(cx, |this, cx| {
+                            this.deploy_filter_menu(key, position, window, cx)
+                        })
+                        .log_err();
+                    });
+                }
+            };
             let console_entries = |menu: ContextMenu| match console_target(&key) {
                 Some(target) if !matches!(key, NodeKey::Object { .. } | NodeKey::Column { .. }) => {
                     let open_workspace = workspace.clone();
@@ -537,6 +834,7 @@ impl DatabasePanel {
                                 })
                                 .log_err();
                         })
+                        .entry("Choose Databases…", None, choose)
                         .entry("Refresh", None, refresh)
                         .when(is_connected, |menu| {
                             menu.entry("Disconnect", None, move |_, cx| {
@@ -549,9 +847,10 @@ impl DatabasePanel {
                             confirm_delete(delete_workspace.clone(), delete_id.clone(), window, cx);
                         })
                 }
-                NodeKey::Database { .. } | NodeKey::Schema { .. } => {
-                    console_entries(menu).entry("Refresh", None, refresh)
-                }
+                NodeKey::Database { .. } => console_entries(menu)
+                    .entry("Choose Schemas…", None, choose)
+                    .entry("Refresh", None, refresh),
+                NodeKey::Schema { .. } => console_entries(menu).entry("Refresh", None, refresh),
                 NodeKey::Object { name, .. } | NodeKey::Column { column: name, .. } => {
                     let name = name.clone();
                     let select_workspace = workspace.clone();
@@ -572,16 +871,18 @@ impl DatabasePanel {
             }
         });
         window.focus(&menu.focus_handle(cx), cx);
-        let subscription = cx.subscribe(&menu, |this, _, _: &DismissEvent, cx| {
-            this.context_menu.take();
-            cx.notify();
+        let dismiss = cx.subscribe(&menu, |this, _, _: &DismissEvent, cx| {
+            this.close_context_menu(cx);
         });
-        self.context_menu = Some(DeployedContextMenu {
-            menu,
-            position,
-            _subscription: subscription,
-        });
-        cx.notify();
+        self.show_context_menu(
+            DeployedContextMenu {
+                menu,
+                position,
+                on_close: None,
+                _subscriptions: vec![dismiss],
+            },
+            cx,
+        );
     }
 
     fn render_entry(&self, index: usize, entry: &Entry, cx: &mut Context<Self>) -> AnyElement {
@@ -660,6 +961,7 @@ impl DatabasePanel {
                     ),
                     NodeKey::Column { .. } => (IconName::Hash, Color::Muted, Color::Default),
                 };
+                let badge = self.filter_badge(key, cx);
                 let is_expanded = self.expanded.contains(key);
                 let is_selected = self.selected.as_ref() == Some(key);
                 let label = if matches!(key, NodeKey::Environment(_)) {
@@ -669,6 +971,7 @@ impl DatabasePanel {
                 };
                 let click_key = key.clone();
                 let menu_key = key.clone();
+                let filter_key = key.clone();
                 let is_leaf = *is_leaf;
                 ListItem::new(("database-node", index))
                     .indent_level(indent)
@@ -703,6 +1006,30 @@ impl DatabasePanel {
                             .gap_1p5()
                             .min_w_0()
                             .child(Label::new(label).color(label_color).truncate())
+                            .when_some(badge, |this, badge| {
+                                let tooltip = match filter_key {
+                                    NodeKey::Connection { .. } => "Choose Databases",
+                                    _ => "Choose Schemas",
+                                };
+                                this.child(
+                                    Button::new(("database-filter", index), badge)
+                                        .style(ButtonStyle::Outlined)
+                                        .size(ButtonSize::Compact)
+                                        .label_size(LabelSize::XSmall)
+                                        .color(Color::Muted)
+                                        .tooltip(Tooltip::text(tooltip))
+                                        .on_click(cx.listener(
+                                            move |this, event: &ClickEvent, window, cx| {
+                                                this.deploy_filter_menu(
+                                                    filter_key.clone(),
+                                                    event.position(),
+                                                    window,
+                                                    cx,
+                                                );
+                                            },
+                                        )),
+                                )
+                            })
                             .when_some(detail.clone(), |this, detail| {
                                 this.child(
                                     Label::new(detail)
@@ -1037,6 +1364,37 @@ impl DatabasePanel {
         if !self.expanded.contains(&key) {
             self.toggle_expanded(&key, cx);
         }
+    }
+
+    pub(crate) fn expand_for_test(&mut self, key: NodeKey, cx: &mut Context<Self>) {
+        if !self.expanded.contains(&key) {
+            self.toggle_expanded(&key, cx);
+        }
+    }
+
+    /// Applies a picker choice; no names means "all".
+    pub(crate) fn choose_for_test(&mut self, key: NodeKey, names: &[&str], cx: &mut Context<Self>) {
+        let choice = FilterChoice {
+            all: names.is_empty(),
+            chosen: names.iter().map(|name| name.to_string()).collect(),
+        };
+        self.apply_filter(&key, &choice, cx);
+    }
+
+    /// Opens the picker as clicking a badge does, then closes it without changes.
+    pub(crate) fn open_and_close_picker_for_test(
+        &mut self,
+        key: NodeKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.deploy_filter_menu(key, Point::default(), window, cx);
+        assert!(self.context_menu.is_some(), "the picker should be open");
+        self.close_context_menu(cx);
+    }
+
+    pub(crate) fn badge_for_test(&self, key: &NodeKey, cx: &App) -> Option<String> {
+        self.filter_badge(key, cx).map(Into::into)
     }
 
     pub(crate) fn visible_labels(&self) -> Vec<String> {

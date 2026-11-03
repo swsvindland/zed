@@ -5,7 +5,8 @@ It has no UI; drivers are async and run on the Tokio runtime from `gpui_tokio`.
 
 - **Profiles** (`ConnectionProfile`, `ConnectionsFile`) live in
   `<config dir>/database_connections.json`, grouped by a free-form `environment`
-  (`dev`, `qa`, `prod`, …). A profile can list several databases on one server.
+  (`dev`, `qa`, `prod`, …). A profile can limit which databases on the server it shows
+  (`databases`) and which schemas in each (`schemas`); empty shows everything.
   Names starting with `prod` (or `production: true`) mark a production connection.
 - **Passwords** never go in that file. `read_password` / `write_password` store them in the
   OS credential store through `zed_credentials_provider`, keyed `zed-database://<profile id>`.
@@ -14,7 +15,8 @@ It has no UI; drivers are async and run on the Tokio runtime from `gpui_tokio`.
 - **SQL Server** uses `tiberius`: TCP (`host`, `host,port`), named instances (`host\instance`,
   via SQL Browser), named pipes (`np:\\.\pipe\…`) and LocalDB (`(localdb)\MSSQLLocalDB`,
   started with `sqllocaldb` and reached over its pipe). Windows integrated authentication or
-  SQL logins.
+  SQL logins. On Azure SQL Database every database the login can see in `master` is listed,
+  since `HAS_DBACCESS` isn't available there.
 - **PostgreSQL** uses `tokio-postgres` with `native-tls` (`sslmode=prefer`, or disabled when
   `encrypt` is off).
 - **`Client`** runs scripts (multiple result sets, affected-row counts), lists databases /

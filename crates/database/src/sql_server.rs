@@ -17,6 +17,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> TdsStream for T {}
 
 type TdsClient = tiberius::Client<Box<dyn TdsStream>>;
 
+/// `SERVERPROPERTY('EngineEdition')` for Azure SQL Database (single databases and elastic pools).
+const AZURE_SQL_DATABASE_EDITION: i32 = 5;
+
 pub struct SqlServerClient {
     client: TdsClient,
     database: Option<String>,
@@ -212,12 +215,21 @@ impl SqlServerClient {
     }
 
     pub async fn list_databases(&mut self) -> Result<Vec<String>> {
-        let rows = self
-            .query_rows(
-                "SELECT name FROM sys.databases WHERE state = 0 AND HAS_DBACCESS(name) = 1 ORDER BY name",
-                &[],
-            )
+        let edition = self
+            .query_rows("SELECT CAST(SERVERPROPERTY('EngineEdition') AS int)", &[])
             .await?;
+        let is_azure_sql_database = edition
+            .first()
+            .and_then(|row| row.get::<i32, _>(0))
+            .is_some_and(|edition| edition == AZURE_SQL_DATABASE_EDITION);
+        // Azure SQL Database doesn't support HAS_DBACCESS (it would hide every user database), and
+        // from `master` its sys.databases already lists only what the login may see.
+        let sql = if is_azure_sql_database {
+            "SELECT name FROM sys.databases WHERE state = 0 ORDER BY name"
+        } else {
+            "SELECT name FROM sys.databases WHERE state = 0 AND HAS_DBACCESS(name) = 1 ORDER BY name"
+        };
+        let rows = self.query_rows(sql, &[]).await?;
         Ok(rows.iter().filter_map(|row| string(row, 0)).collect())
     }
 
