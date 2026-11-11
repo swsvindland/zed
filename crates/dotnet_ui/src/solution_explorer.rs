@@ -18,7 +18,7 @@ use project::DirectoryLister;
 use ui::{ContextMenu, Icon, IconName, IconSize, Label, LabelSize, ListItem, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::{
-    MultiWorkspace, OpenMode, OpenOptions, Workspace,
+    MultiWorkspace, OpenMode, OpenOptions, OpenPathPromptMode, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
 };
 
@@ -677,6 +677,7 @@ fn open_solution(workspace: &mut Workspace, window: &mut Window, cx: &mut Contex
             prompt: Some("Open Solution".into()),
         },
         DirectoryLister::Local(workspace.project().clone(), workspace.app_state().fs.clone()),
+        OpenPathPromptMode::SelectPath,
         window,
         cx,
     );
@@ -686,7 +687,7 @@ fn open_solution(workspace: &mut Workspace, window: &mut Window, cx: &mut Contex
             .await
             .log_err()
             .flatten()
-            .and_then(|paths| paths.into_iter().next())
+            .and_then(|result| result.paths.into_iter().next())
         else {
             return;
         };

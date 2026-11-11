@@ -106,6 +106,11 @@ impl TableView {
         let data_row = this.engine.d2d_mapping().get_data_row(display_row)?;
         let row = this.engine.contents.get_row(data_row)?;
 
+        let selection_bounds = this
+            .selection
+            .as_ref()
+            .and_then(|selection| selection.display_bounds(this.engine.d2d_mapping()));
+
         let mut elements = Vec::with_capacity(cols);
         elements.push(this.create_row_identifier_cell(display_row, data_row, cx)?);
 
@@ -130,15 +135,26 @@ impl TableView {
                 .and_then(|decoration| decoration.background)
                 .or_else(|| row_decoration.and_then(|decoration| decoration.background));
 
+            let is_in_selection =
+                selection_bounds
+                    .as_ref()
+                    .is_some_and(|(row_range, col_range)| {
+                        row_range.contains(&display_row.0) && col_range.contains(&col.0)
+                    });
+
             let is_focus_cell = this
                 .selection
                 .as_ref()
                 .is_some_and(|selection| selection.focus == data_cell_id);
 
-            let cell_bg = match (is_focus_cell, decoration_bg) {
-                (_, Some(background)) => Some(background),
-                (true, None) => Some(cx.theme().colors().element_selected),
-                (false, None) => None,
+            let cell_bg = if decoration_bg.is_some() {
+                decoration_bg
+            } else if is_focus_cell {
+                Some(cx.theme().colors().element_selected)
+            } else if is_in_selection {
+                Some(cx.theme().colors().element_hover)
+            } else {
+                None
             };
             let cell_editor = this
                 .cell_editor

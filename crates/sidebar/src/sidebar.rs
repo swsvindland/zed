@@ -39,7 +39,7 @@ use menu::{
     Cancel, Confirm, SelectChild, SelectFirst, SelectLast, SelectNext, SelectParent, SelectPrevious,
 };
 use notifications::status_toast::StatusToast;
-use platform_title_bar::apply_title_bar_insets;
+use platform_title_bar::{SidebarWindowControls, apply_title_bar_insets};
 use project::{AgentId, AgentRegistryStore, Event as ProjectEvent, WorktreeId};
 use recent_projects::sidebar_recent_projects::SidebarRecentProjects;
 use remote::RemoteConnectionOptions;
@@ -7377,13 +7377,11 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let has_query = self.has_filter_query(cx);
-        let sidebar_on_left = self.side(cx) == SidebarSide::Left;
-        let sidebar_on_right = self.side(cx) == SidebarSide::Right;
-        let not_fullscreen = !window.is_fullscreen() && !window.is_simple_fullscreen();
-        let traffic_lights = cfg!(target_os = "macos") && not_fullscreen && sidebar_on_left;
-        let left_window_controls = !cfg!(target_os = "macos") && not_fullscreen && sidebar_on_left;
-        let right_window_controls =
-            !cfg!(target_os = "macos") && not_fullscreen && sidebar_on_right;
+        let SidebarWindowControls {
+            traffic_lights,
+            left: left_window_controls,
+            right: right_window_controls,
+        } = SidebarWindowControls::new(self.side(cx), window, cx);
         let header_height = platform_title_bar_height(window);
 
         h_flex()
@@ -7419,11 +7417,14 @@ impl Sidebar {
                         this.child(Divider::vertical().color(ui::DividerColor::Border))
                     })
                     .child(
-                        div().ml_1().child(
-                            Icon::new(IconName::MagnifyingGlass)
-                                .size(IconSize::Small)
-                                .color(Color::Muted),
-                        ),
+                        div()
+                            .debug_selector(|| "sidebar-header-search".into())
+                            .ml_1()
+                            .child(
+                                Icon::new(IconName::MagnifyingGlass)
+                                    .size(IconSize::Small)
+                                    .color(Color::Muted),
+                            ),
                     )
                     .child(self.render_filter_input(cx))
                     .child(
@@ -8109,9 +8110,9 @@ fn all_thread_infos_for_workspace(
         .conversation_views()
         .into_iter()
         .filter_map(|conversation_view| {
-            let has_pending_tool_call = conversation_view
+            let is_waiting_for_input = conversation_view
                 .read(cx)
-                .root_thread_has_pending_tool_call(cx);
+                .root_thread_is_waiting_for_input(cx);
             let conversation_thread_id = conversation_view.read(cx).parent_id();
             let thread_view = conversation_view.read(cx).root_thread_view()?;
             let thread_view_ref = thread_view.read(cx);
@@ -8128,7 +8129,7 @@ fn all_thread_infos_for_workspace(
             let session_id = thread.session_id().clone();
             let is_background = agent_panel.is_retained_thread(&conversation_thread_id);
 
-            let status = if has_pending_tool_call {
+            let status = if is_waiting_for_input {
                 AgentThreadStatus::WaitingForConfirmation
             } else if thread.had_error() {
                 AgentThreadStatus::Error
@@ -8355,7 +8356,7 @@ fn dump_single_workspace(workspace: &Workspace, output: &mut String, cx: &gpui::
                 .is_some_and(|conversation_view| {
                     conversation_view
                         .read(cx)
-                        .root_thread_has_pending_tool_call(cx)
+                        .root_thread_is_waiting_for_input(cx)
                 })
             {
                 write!(output, ", awaiting confirmation").ok();
@@ -8387,7 +8388,7 @@ fn dump_single_workspace(workspace: &Workspace, output: &mut String, cx: &gpui::
                     write!(output, " [{status}, {entry_count} entries").ok();
                     if conversation_view
                         .read(cx)
-                        .root_thread_has_pending_tool_call(cx)
+                        .root_thread_is_waiting_for_input(cx)
                     {
                         write!(output, ", awaiting confirmation").ok();
                     }
