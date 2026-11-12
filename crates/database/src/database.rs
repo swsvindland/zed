@@ -2,7 +2,10 @@
 //!
 //! Drivers are async and expect to run on a Tokio runtime (see `gpui_tokio`).
 
+pub mod catalog;
+pub mod completion;
 mod connections;
+mod execution;
 mod postgres;
 pub mod sql;
 mod sql_server;
@@ -14,8 +17,13 @@ use std::{
 };
 
 use anyhow::Result;
+use futures::StreamExt as _;
 
 pub use connections::*;
+pub use execution::{
+    DEFAULT_FETCH_LIMIT, Execution, ExecutionEnd, ExecutionEvent, ExecutionHandle,
+    ExecutionOptions, Fetch, SessionReset, collect_outcomes, execution,
+};
 use sql::{EditColumn, ParameterizedStatement, TableRef};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,6 +79,7 @@ pub struct ColumnSummary {
 pub struct EditTarget {
     pub table: TableRef,
     /// The table column behind each result column. `None` for expressions and other tables.
+    /// Has one entry per column the statement was described with.
     pub columns: Vec<Option<EditColumn>>,
     /// Per result column: whether it may be changed. Identity, computed and expression columns
     /// are read-only, though an identity key still identifies rows.
@@ -107,16 +116,29 @@ impl Client {
         })
     }
 
+    /// Runs `sql` to completion and collects every row.
     pub async fn run(&mut self, sql: &str) -> Result<QueryOutput> {
         let start = Instant::now();
-        let outcomes = match self {
-            Client::SqlServer(client) => client.run(sql).await?,
-            Client::Postgres(client) => client.run(sql).await?,
-        };
+        let (mut execution, events) = execution::uninterruptible();
+        self.execute(sql, &mut execution).await?;
+        drop(execution);
+        let events = events.collect::<Vec<_>>().await;
         Ok(QueryOutput {
-            outcomes,
+            outcomes: collect_outcomes(events),
             elapsed: start.elapsed(),
         })
+    }
+
+    /// Runs `sql`, sending results to `execution` as they arrive. It pauses at the fetch limit
+    /// and returns once the batch completes, is cancelled or times out. A run stopped early
+    /// leaves the session ready for the next statement, or fails with [`SessionReset`] when it
+    /// couldn't.
+    pub async fn execute(&mut self, sql: &str, execution: &mut Execution) -> Result<ExecutionEnd> {
+        execution.start();
+        match self {
+            Client::SqlServer(client) => client.execute(sql, execution).await,
+            Client::Postgres(client) => client.execute(sql, execution).await,
+        }
     }
 
     pub async fn list_databases(&mut self) -> Result<Vec<String>> {
@@ -149,7 +171,9 @@ impl Client {
 
     /// Works out whether the result of `sql` can be edited in place. Only a single statement
     /// reading from one table that has a primary key, with every key column selected, qualifies.
-    pub async fn editability(&mut self, sql: &str, result: &ResultSet) -> Result<Editability> {
+    /// It describes the statement without running it, so it can be asked before the run; the
+    /// caller checks [`EditTarget::columns`] against the result's columns.
+    pub async fn editability(&mut self, sql: &str) -> Result<Editability> {
         let statements = sql::split_statements(sql, self.dialect());
         if statements.len() != 1 {
             return Ok(Err(
@@ -157,8 +181,16 @@ impl Client {
             ));
         }
         match self {
-            Client::SqlServer(client) => client.editability(sql, result).await,
-            Client::Postgres(client) => client.editability(sql, result).await,
+            Client::SqlServer(client) => client.editability(sql).await,
+            Client::Postgres(client) => client.editability(sql).await,
+        }
+    }
+
+    /// Reads the schemas, tables, views, columns and foreign keys that SQL completion offers.
+    pub async fn catalog(&mut self) -> Result<catalog::Catalog> {
+        match self {
+            Client::SqlServer(client) => client.catalog().await,
+            Client::Postgres(client) => client.catalog().await,
         }
     }
 
@@ -203,6 +235,9 @@ pub struct PoolKey {
 /// Errors after which a session can't be trusted, so the pool should reconnect.
 pub fn is_connection_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
+        if cause.is::<SessionReset>() {
+            return true;
+        }
         if let Some(error) = cause.downcast_ref::<tiberius::error::Error>() {
             return matches!(
                 error,

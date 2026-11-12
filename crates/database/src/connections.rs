@@ -110,6 +110,13 @@ pub struct ConnectionProfile {
     /// Overrides production detection from the environment name.
     #[serde(default)]
     pub production: Option<bool>,
+    /// Rows read from each result set before the grid asks for more. Unset uses
+    /// [`crate::DEFAULT_FETCH_LIMIT`]; 0 reads every row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetch_limit: Option<usize>,
+    /// Seconds a statement may run before it is cancelled. Unset or 0 waits indefinitely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_timeout_seconds: Option<u64>,
 }
 
 fn default_true() -> bool {
@@ -136,6 +143,23 @@ impl ConnectionProfile {
             encrypt: true,
             trust_server_certificate: false,
             production: None,
+            fetch_limit: None,
+            query_timeout_seconds: None,
+        }
+    }
+
+    /// How statements run in consoles on this connection.
+    pub fn execution_options(&self) -> crate::ExecutionOptions {
+        crate::ExecutionOptions {
+            fetch_limit: match self.fetch_limit {
+                None => Some(crate::DEFAULT_FETCH_LIMIT),
+                Some(0) => None,
+                Some(limit) => Some(limit),
+            },
+            timeout: self
+                .query_timeout_seconds
+                .filter(|seconds| *seconds > 0)
+                .map(std::time::Duration::from_secs),
         }
     }
 

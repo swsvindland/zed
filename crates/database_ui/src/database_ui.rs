@@ -1,6 +1,7 @@
 //! DataGrip-style database tools: a connection tree panel, SQL consoles and an editable result
 //! grid.
 
+mod completion_provider;
 mod connection_modal;
 mod console;
 mod database_panel;
@@ -10,20 +11,31 @@ mod push_modal;
 mod results_view;
 mod sql_language;
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context as _, Result};
 use database::{
-    Client, ConnectionPool, ConnectionProfile, ConnectionsFile, PoolKey, is_connection_error,
+    Client, ConnectionPool, ConnectionProfile, ConnectionsFile, PoolKey, catalog::Catalog,
+    is_connection_error,
 };
-use futures::future::BoxFuture;
+use futures::{
+    FutureExt as _,
+    future::{BoxFuture, Shared},
+};
 use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Global, SharedString, Task};
 use gpui_tokio::Tokio;
 use util::ResultExt as _;
 
 pub use connection_modal::ConnectionModal;
-pub use console::{RunScript, RunStatement, SelectConnection, default_key_bindings};
+pub use console::{
+    RefreshCompletionMetadata, RunScript, RunStatement, SelectConnection, default_key_bindings,
+};
 pub use database_panel::DatabasePanel;
+pub use results_view::{FetchAllRows, FetchNextPage, StopStatement};
 
 gpui::actions!(
     database,
@@ -94,7 +106,19 @@ pub struct DatabaseStore {
     /// Whether changes are written to the connections file. Off for connections injected by
     /// tests, so they never overwrite the user's file.
     persist: bool,
+    /// Metadata for SQL completion, by connection id and database (empty for the default).
+    catalogs: HashMap<(String, String), CatalogState>,
 }
+
+enum CatalogState {
+    Loading(Shared<Task<Option<Arc<Catalog>>>>),
+    Loaded(Arc<Catalog>),
+    /// Loading failed; completion offers keywords until the next attempt.
+    Failed(Instant),
+}
+
+/// How long a database whose metadata failed to load waits before completion tries again.
+const CATALOG_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 struct GlobalDatabaseStore(Entity<DatabaseStore>);
 
@@ -115,6 +139,7 @@ impl DatabaseStore {
                 passwords: HashMap::default(),
                 known_databases: HashMap::default(),
                 persist: true,
+                catalogs: HashMap::default(),
             };
             store.reload(cx);
             store
@@ -158,7 +183,80 @@ impl DatabaseStore {
         self.pool.is_connected(connection_id)
     }
 
+    /// The completion metadata for a database, loaded on first use over the metadata session.
+    /// Resolves to `None` while it can't be loaded.
+    pub fn catalog(
+        &mut self,
+        connection_id: &str,
+        database: &str,
+        cx: &mut Context<Self>,
+    ) -> Shared<Task<Option<Arc<Catalog>>>> {
+        let key = (connection_id.to_string(), database.to_string());
+        match self.catalogs.get(&key) {
+            Some(CatalogState::Loaded(catalog)) => {
+                return Task::ready(Some(catalog.clone())).shared();
+            }
+            Some(CatalogState::Loading(task)) => return task.clone(),
+            Some(CatalogState::Failed(at)) if at.elapsed() < CATALOG_RETRY_INTERVAL => {
+                return Task::ready(None).shared();
+            }
+            Some(CatalogState::Failed(_)) | None => {}
+        }
+        let load = self.with_client(
+            PoolKey {
+                connection_id: key.0.clone(),
+                database: key.1.clone(),
+                session: METADATA_SESSION.to_string(),
+            },
+            |client| async move { client.catalog().await }.boxed(),
+            cx,
+        );
+        let task = cx
+            .spawn({
+                let key = key.clone();
+                async move |this, cx| {
+                    let result = load.await;
+                    this.update(cx, |this, _| {
+                        // Invalidated while loading: leave the newer state alone.
+                        if !matches!(this.catalogs.get(&key), Some(CatalogState::Loading(_))) {
+                            return result.ok().map(Arc::new);
+                        }
+                        match result {
+                            Ok(catalog) => {
+                                let catalog = Arc::new(catalog);
+                                this.catalogs
+                                    .insert(key, CatalogState::Loaded(catalog.clone()));
+                                Some(catalog)
+                            }
+                            Err(error) => {
+                                log::error!("failed to load completion metadata: {error:#}");
+                                this.catalogs
+                                    .insert(key, CatalogState::Failed(Instant::now()));
+                                None
+                            }
+                        }
+                    })
+                    .ok()
+                    .flatten()
+                }
+            })
+            .shared();
+        self.catalogs
+            .insert(key, CatalogState::Loading(task.clone()));
+        task
+    }
+
+    /// Forgets completion metadata so it's read again on next use: for one database, or for
+    /// every database of the connection.
+    pub fn invalidate_catalog(&mut self, connection_id: &str, database: Option<&str>) {
+        self.catalogs.retain(|(connection, cached_database), _| {
+            connection != connection_id
+                || database.is_some_and(|database| database != cached_database)
+        });
+    }
+
     pub fn reload(&mut self, cx: &mut Context<Self>) {
+        self.catalogs.clear();
         match ConnectionsFile::load() {
             Ok(connections) => {
                 self.connections = connections;
@@ -191,6 +289,7 @@ impl DatabaseStore {
         }
         self.pool.discard_connection(&profile.id);
         self.passwords.remove(&profile.id);
+        self.invalidate_catalog(&profile.id, None);
         let persist = self.persist;
         cx.spawn(async move |this, cx| {
             if let Some(password) = &password {
@@ -255,6 +354,7 @@ impl DatabaseStore {
             .retain(|existing| existing.id != connection_id);
         self.pool.discard_connection(connection_id);
         self.passwords.remove(connection_id);
+        self.invalidate_catalog(connection_id, None);
         let persist = self.persist;
         cx.spawn(async move |this, cx| {
             if profile.needs_password() {
@@ -274,6 +374,7 @@ impl DatabaseStore {
 
     pub fn disconnect(&mut self, connection_id: &str, cx: &mut Context<Self>) {
         self.pool.discard_connection(connection_id);
+        self.invalidate_catalog(connection_id, None);
         cx.notify();
     }
 

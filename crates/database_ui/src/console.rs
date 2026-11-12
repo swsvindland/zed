@@ -21,7 +21,11 @@ use workspace::{
     Workspace,
 };
 
-use crate::{DatabaseStore, database_panel::environment_color, results_view::QueryResultsView};
+use crate::{
+    DatabaseStore, completion_provider,
+    database_panel::environment_color,
+    results_view::{ActiveConsoleRuns, QueryResultsView, StopStatement},
+};
 
 gpui::actions!(
     database,
@@ -33,6 +37,8 @@ gpui::actions!(
         RunScript,
         /// Chooses the database connection that the current SQL editor runs against.
         SelectConnection,
+        /// Reads the current SQL editor's database metadata again, for completion.
+        RefreshCompletionMetadata,
     ]
 );
 
@@ -40,14 +46,16 @@ gpui::actions!(
 /// reload, so these are applied from `load_default_keymap` rather than once at startup.
 pub fn default_key_bindings() -> Vec<KeyBinding> {
     let context = Some("Editor && extension == sql");
-    let (run_statement, run_script) = if cfg!(target_os = "macos") {
-        ("cmd-enter", "cmd-shift-enter")
+    let (run_statement, run_script, stop) = if cfg!(target_os = "macos") {
+        ("cmd-enter", "cmd-shift-enter", "cmd-f2")
     } else {
-        ("ctrl-enter", "ctrl-shift-enter")
+        ("ctrl-enter", "ctrl-shift-enter", "ctrl-f2")
     };
     vec![
         KeyBinding::new(run_statement, RunStatement, context),
         KeyBinding::new(run_script, RunScript, context),
+        KeyBinding::new(stop, StopStatement, context),
+        KeyBinding::new(stop, StopStatement, Some("DatabaseResults")),
     ]
 }
 
@@ -150,12 +158,19 @@ fn editor_path(editor: &Entity<Editor>, cx: &App) -> Option<PathBuf> {
 }
 
 pub fn target_for_editor(editor: &Entity<Editor>, cx: &App) -> Option<ConsoleTarget> {
-    if let Some(target) =
-        buffer_id(editor, cx).and_then(|id| cx.try_global::<ConsoleBindings>()?.0.get(&id).cloned())
+    target_for_buffer(&editor.read(cx).buffer().read(cx).as_singleton()?, cx)
+}
+
+/// Like [`target_for_editor`], for code that runs while the editor is being updated.
+pub fn target_for_buffer(buffer: &Entity<language::Buffer>, cx: &App) -> Option<ConsoleTarget> {
+    if let Some(target) = cx
+        .try_global::<ConsoleBindings>()
+        .and_then(|bindings| bindings.0.get(&buffer.entity_id()).cloned())
     {
         return Some(target);
     }
-    target_from_path(&editor_path(editor, cx)?)
+    let file = buffer.read(cx).file()?;
+    target_from_path(&file.as_local()?.abs_path(cx))
 }
 
 pub fn is_sql_editor(editor: &Entity<Editor>, cx: &App) -> bool {
@@ -173,6 +188,7 @@ pub fn bind_editor(editor: &Entity<Editor>, target: ConsoleTarget, cx: &mut App)
         return;
     };
     cx.default_global::<ConsoleBindings>().0.insert(id, target);
+    completion_provider::install(editor, cx);
 }
 
 /// Pool session for a console, so each one keeps its own transaction and temp tables.
@@ -191,6 +207,28 @@ pub fn register(workspace: &mut Workspace) {
         if let Some(editor) = workspace.active_item_as::<Editor>(cx) {
             ConnectionPicker::toggle(workspace, editor, window, cx);
         }
+    });
+    workspace.register_action(|workspace, _: &StopStatement, _, cx| {
+        let Some(buffer_id) = workspace
+            .active_item_as::<Editor>(cx)
+            .and_then(|editor| buffer_id(&editor, cx))
+        else {
+            return;
+        };
+        if let Some(view) = QueryResultsView::find(workspace, buffer_id, cx) {
+            view.update(cx, |view, cx| view.stop_if_running(cx));
+        }
+    });
+    workspace.register_action(|workspace, _: &RefreshCompletionMetadata, _, cx| {
+        let Some(target) = workspace
+            .active_item_as::<Editor>(cx)
+            .and_then(|editor| target_for_editor(&editor, cx))
+        else {
+            return;
+        };
+        DatabaseStore::global(cx).update(cx, |store, _| {
+            store.invalidate_catalog(&target.connection_id, Some(&target.database))
+        });
     });
 }
 
@@ -361,6 +399,7 @@ impl ConsoleToolbar {
             _subscriptions: vec![
                 cx.observe(&store, |_, _, cx| cx.notify()),
                 cx.observe_global::<ConsoleBindings>(|_, cx| cx.notify()),
+                cx.observe_global::<ActiveConsoleRuns>(|_, cx| cx.notify()),
             ],
         }
     }
@@ -375,10 +414,13 @@ impl ToolbarItemView for ConsoleToolbar {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> ToolbarItemLocation {
-        self.editor = active_pane_item
+        let editor = active_pane_item
             .and_then(|item| item.act_as::<Editor>(cx))
-            .filter(|editor| is_sql_editor(editor, cx))
-            .map(|editor| editor.downgrade());
+            .filter(|editor| is_sql_editor(editor, cx));
+        if let Some(editor) = &editor {
+            completion_provider::install(editor, cx);
+        }
+        self.editor = editor.map(|editor| editor.downgrade());
         cx.notify();
         if self.editor.is_some() {
             ToolbarItemLocation::PrimaryRight
@@ -415,6 +457,11 @@ impl Render for ConsoleToolbar {
         };
         let picker_editor = editor.downgrade();
         let run_editor_handle = editor.downgrade();
+        let stop_editor_handle = editor.downgrade();
+        let is_running = buffer_id(&editor, cx).is_some_and(|id| {
+            cx.try_global::<ActiveConsoleRuns>()
+                .is_some_and(|runs| runs.0.contains(&id))
+        });
         h_flex()
             .gap_1()
             .child(
@@ -449,6 +496,20 @@ impl Render for ConsoleToolbar {
                         }
                     }),
             )
+            .when(is_running, |this| {
+                this.child(
+                    IconButton::new("database-console-stop", IconName::Stop)
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Error)
+                        .tooltip(Tooltip::for_action_title("Stop", &StopStatement))
+                        .on_click(move |_, window, cx| {
+                            if let Some(editor) = stop_editor_handle.upgrade() {
+                                window.focus(&editor.focus_handle(cx), cx);
+                                window.dispatch_action(StopStatement.boxed_clone(), cx);
+                            }
+                        }),
+                )
+            })
             .into_any_element()
     }
 }

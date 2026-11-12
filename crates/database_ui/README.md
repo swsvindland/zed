@@ -10,7 +10,8 @@ Environments are colored (dev green, qa yellow, prod red) and connected servers 
 
 - **+** (`database: new connection`) opens a form: driver, environment, host, port,
   Windows or password authentication, databases to show (empty shows all), default database,
-  encryption and certificate trust, and a production override. **Test Connection** checks it.
+  fetch limit and query timeout, encryption and certificate trust, and a production override.
+  **Test Connection** checks it.
   Passwords go to the OS credential store, never the JSON file.
 - Expanded connections and databases show a badge such as **5 of 19**. Click it (or right-click
   and pick **Choose Databases…** / **Choose Schemas…**) for a checklist of what the server has;
@@ -31,8 +32,33 @@ so it persists and keeps its connection. Any other `.sql` file can be bound with
 - Results open in a pane below the editor: a grid per result set (sortable and filterable,
   from `tabular_data_preview`), plus a **Messages** tab with row counts, timing and errors.
   Each console has its own session, so transactions and temp tables carry over between runs.
+- Rows stream in a page at a time. Each result set stops at the connection's fetch limit
+  (500 rows unless set in the connection form; 0 fetches everything) and its tab shows
+  **500+**. **Next 500** (`database: fetch next page`) and **All** (`database: fetch all rows`)
+  read more from the result, which stays open on the server until then. The console's session
+  is busy meanwhile, so running another statement or pushing edits closes it first.
+- **Stop** (`ctrl-f2` / `cmd-f2`, `database: stop statement`, or the red button in the console
+  toolbar and the results header) cancels the running statement, or closes an open result.
+  Rows already read stay in the grid. A connection's query timeout cancels the same way.
+  On encrypted SQL Server connections a stop also closes the console's session; see the
+  `database` README.
+- `NULL` shows as a muted `<null>`, distinct from an empty string, in the grid and its filters.
 - Zed has no SQL grammar of its own, so this crate registers one (`tree-sitter-sequel`) unless
   a SQL language is already registered.
+
+## Completion
+
+Consoles and `.sql` editors with a connection get completion from the database itself,
+through the editor's completion-provider hook rather than a SQL language server. Results from
+language servers and snippets still appear, after these.
+
+- Metadata is read the first time a database's console asks, over the panel's metadata
+  session, and cached per connection and database.
+- It's read again after a console runs DDL (`CREATE`, `ALTER`, `DROP`, `sp_rename`,
+  `SELECT … INTO`), when the database's node is refreshed in the panel, on
+  `database: refresh completion metadata`, and when connections are reloaded or edited.
+- See the `database` README for what is offered where. While metadata is loading or failed
+  to load, only keywords are offered.
 
 ## Editing results
 
@@ -40,7 +66,10 @@ When the statement reads from one table with a primary key and every key column 
 the grid is editable:
 
 - Double-click a cell, press Enter or F2, or start typing to edit; Enter commits, Escape
-  cancels. Changed cells are highlighted until pushed.
+  cancels. Changed cells are highlighted until pushed. Opening a `NULL` cell and leaving it
+  without typing keeps it `NULL`; **Set NULL** writes `NULL` back.
+- A result paused at the fetch limit can be edited too; the rows not yet fetched aren't
+  affected.
 - **Add Row**, **Delete Selected Row** (toggle), **Set NULL** and **Revert** work on the
   pending changes.
 - **Push** shows the generated `UPDATE … WHERE <key>`, `INSERT` and `DELETE` statements with
@@ -50,3 +79,9 @@ the grid is editable:
 When a result can't be edited (joins, several statements, no primary key, key not selected,
 views without a single base table), the grid says why. Identity and computed columns are
 read-only.
+
+## Tests
+
+With `ZED_DATABASE_TEST_SQL_SERVER` set (see the `database` README), `cargo test -p database_ui`
+also drives the panel, a console, the grid, paging, Stop, NULL editing, completion and a push
+against that server, in a `ZedDatabaseUiTest` database.

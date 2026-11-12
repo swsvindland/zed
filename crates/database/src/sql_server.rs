@@ -1,5 +1,13 @@
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
+
 use anyhow::{Context as _, Result};
-use futures::{AsyncRead, AsyncWrite, TryStreamExt as _};
+use futures::{AsyncRead, AsyncWrite, StreamExt as _};
 use tiberius::{
     AuthMethod, ColumnData, ColumnType, Config, EncryptionLevel, FromSql, Query, QueryItem, Row,
     SqlBrowser as _,
@@ -8,7 +16,11 @@ use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt 
 
 use crate::{
     Authentication, ColumnInfo, ColumnSummary, ConnectionProfile, DatabaseObject, EditTarget,
-    Editability, ObjectKind, ResultSet, StatementOutcome, check_affected,
+    Editability, ObjectKind, SessionReset,
+    catalog::{Catalog, ObjectName},
+    check_affected,
+    execution::{Execution, ExecutionEnd, ExecutionEvent, Item, ReadEnd, Settled, settle},
+    is_connection_error,
     sql::{self, EditColumn, ParameterizedStatement, TableRef},
 };
 
@@ -19,10 +31,26 @@ type TdsClient = tiberius::Client<Box<dyn TdsStream>>;
 
 /// `SERVERPROPERTY('EngineEdition')` for Azure SQL Database (single databases and elastic pools).
 const AZURE_SQL_DATABASE_EDITION: i32 = 5;
+/// How long to keep reading a stopped result before sending an Attention.
+const DRAIN_BEFORE_CANCEL: Duration = Duration::from_millis(250);
+/// How long the server may take to acknowledge an Attention. It rolls back the statement's
+/// changes first, so this is generous.
+const CANCEL_TIMEOUT: Duration = Duration::from_secs(30);
+
+enum Stopped {
+    Finished,
+    /// The rest of the result was read, so the session is already in sync.
+    Drained(crate::execution::Interrupt),
+    /// The request is still running on the server.
+    Interrupted(crate::execution::Interrupt),
+}
 
 pub struct SqlServerClient {
     client: TdsClient,
     database: Option<String>,
+    /// Whether the stream drops stray Attention acknowledgements (see [`AttentionAckFilter`]),
+    /// which is what lets a cancelled session be reused.
+    filters_attention_acks: bool,
 }
 
 enum Endpoint {
@@ -74,6 +102,9 @@ impl SqlServerClient {
     ) -> Result<Self> {
         let mut config = Config::new();
         config.application_name("Zed");
+        // Tiberius's own command timeout leaves the session out of sync when it fires. Timeouts
+        // are applied by `Execution` instead, which cancels the statement and keeps the session.
+        config.command_timeout(None);
         if let Some(database) = database {
             config.database(database);
         }
@@ -141,65 +172,111 @@ impl SqlServerClient {
             }
         };
 
+        // Below TLS the filter would see ciphertext, so encrypted sessions go without it.
+        let is_encrypted = matches!(
+            parse_endpoint(&profile.host, profile.port),
+            Endpoint::Tcp { .. }
+        ) && profile.encrypt;
+        let filter = (!is_encrypted).then(|| Arc::new(AtomicBool::new(false)));
+        let stream: Box<dyn TdsStream> = match &filter {
+            Some(enabled) => Box::new(AttentionAckFilter::new(stream, enabled.clone())),
+            None => stream,
+        };
         let client = tiberius::Client::connect(config, stream)
             .await
             .with_context(|| format!("logging in to {}", profile.host))?;
+        // Login is done and fully read, so the stream is at a packet boundary from here on.
+        if let Some(enabled) = &filter {
+            enabled.store(true, Ordering::Release);
+        }
         Ok(Self {
             client,
             database: database.map(ToOwned::to_owned),
+            filters_attention_acks: filter.is_some(),
         })
     }
 
-    pub async fn run(&mut self, sql: &str) -> Result<Vec<StatementOutcome>> {
+    pub async fn execute(&mut self, sql: &str, execution: &mut Execution) -> Result<ExecutionEnd> {
         if !sql::may_return_rows(sql) {
-            let result = self.client.execute(sql, &[]).await?;
-            let counts = result.rows_affected();
-            if counts.is_empty() {
-                return Ok(vec![StatementOutcome::Completed]);
-            }
-            return Ok(counts
-                .iter()
-                .map(|count| StatementOutcome::RowsAffected(*count))
-                .collect());
+            let interrupt = match execution.guard(self.client.execute(sql, &[])).await {
+                Ok(result) => {
+                    for count in result?.rows_affected() {
+                        execution.emit(ExecutionEvent::RowsAffected(*count));
+                    }
+                    return Ok(ExecutionEnd::Completed);
+                }
+                Err(interrupt) => interrupt,
+            };
+            self.cancel_request().await?;
+            return Ok(interrupt.into());
         }
 
-        let mut stream = self.client.simple_query(sql).await?;
-        let mut outcomes = Vec::new();
-        let mut current: Option<ResultSet> = None;
-        while let Some(item) = stream.try_next().await? {
-            match item {
-                QueryItem::Metadata(metadata) => {
-                    if let Some(result) = current.take() {
-                        outcomes.push(StatementOutcome::Rows(result));
-                    }
-                    current = Some(ResultSet {
-                        columns: metadata
-                            .columns()
-                            .iter()
-                            .map(|column| ColumnInfo {
-                                name: column.name().to_string(),
-                                type_name: type_name(column.column_type()).to_string(),
-                            })
-                            .collect(),
-                        rows: Vec::new(),
-                    });
-                }
-                QueryItem::Row(row) => {
-                    if let Some(result) = current.as_mut() {
-                        result
-                            .rows
-                            .push(row.into_iter().map(format_value).collect());
+        let stopped = match execution.guard(self.client.simple_query(sql)).await {
+            Err(interrupt) => Stopped::Interrupted(interrupt),
+            Ok(stream) => {
+                let mut items = stream?.map(|item| {
+                    Ok(match item? {
+                        QueryItem::Metadata(metadata) => Item::Columns(
+                            metadata
+                                .columns()
+                                .iter()
+                                .map(|column| ColumnInfo {
+                                    name: column.name().to_string(),
+                                    type_name: type_name(column.column_type()).to_string(),
+                                })
+                                .collect(),
+                        ),
+                        QueryItem::Row(row) => {
+                            Item::Row(row.into_iter().map(format_value).collect())
+                        }
+                    })
+                });
+                match execution.read(&mut items).await? {
+                    ReadEnd::Exhausted => Stopped::Finished,
+                    // Dropping the stream mid-token would leave the Attention's acknowledgement
+                    // unreadable, so stop between tokens first. An Attention sent after the
+                    // whole response arrived is acknowledged in a message of its own, which
+                    // tiberius doesn't wait for, so a drained result must not get one.
+                    ReadEnd::Interrupted(interrupt) => {
+                        match settle(&mut items, DRAIN_BEFORE_CANCEL, is_connection_error).await? {
+                            Settled::Ended => Stopped::Drained(interrupt),
+                            Settled::Open => Stopped::Interrupted(interrupt),
+                        }
                     }
                 }
             }
+        };
+        match stopped {
+            Stopped::Finished => Ok(ExecutionEnd::Completed),
+            Stopped::Drained(interrupt) => Ok(interrupt.into()),
+            Stopped::Interrupted(interrupt) => {
+                self.cancel_request().await?;
+                Ok(interrupt.into())
+            }
         }
-        if let Some(result) = current.take() {
-            outcomes.push(StatementOutcome::Rows(result));
+    }
+
+    /// Sends an Attention for the request in flight and waits for the server to acknowledge
+    /// it. If the session can't be brought back in sync it fails with [`SessionReset`], which
+    /// makes the pool reconnect.
+    async fn cancel_request(&mut self) -> Result<()> {
+        match tokio::time::timeout(CANCEL_TIMEOUT, self.client.cancel_query()).await {
+            Ok(Ok(())) => Ok(()),
+            // SQL Server ends the cancelled request's response, then acknowledges the Attention
+            // in a message of its own, and tiberius gives up at the end of the first message.
+            // The filter drops the acknowledgement when it arrives.
+            Ok(Err(tiberius::error::Error::Protocol(message)))
+                if self.filters_attention_acks && message.contains("Never got a DONE token") =>
+            {
+                Ok(())
+            }
+            Ok(Err(error)) => Err(SessionReset(format!("{error}")).into()),
+            Err(_) => Err(SessionReset(format!(
+                "SQL Server didn't acknowledge the cancel within {} s",
+                CANCEL_TIMEOUT.as_secs()
+            ))
+            .into()),
         }
-        if outcomes.is_empty() {
-            outcomes.push(StatementOutcome::Completed);
-        }
-        Ok(outcomes)
     }
 
     async fn query_rows(&mut self, sql: &str, params: &[&str]) -> Result<Vec<Row>> {
@@ -299,7 +376,94 @@ impl SqlServerClient {
             .collect())
     }
 
-    pub async fn editability(&mut self, sql: &str, result: &ResultSet) -> Result<Editability> {
+    pub async fn catalog(&mut self) -> Result<Catalog> {
+        let default_schema = self
+            .query_rows("SELECT SCHEMA_NAME()", &[])
+            .await?
+            .first()
+            .and_then(|row| string(row, 0));
+        let schemas = self.list_schemas().await?;
+        let column_rows = self
+            .query_rows(
+                "SELECT SCHEMA_NAME(o.schema_id), o.name, RTRIM(o.type), c.name, \
+                   t.name + CASE \
+                     WHEN t.name IN ('varchar', 'char', 'varbinary', 'binary') THEN '(' + \
+                       CASE WHEN c.max_length = -1 THEN 'max' ELSE CAST(c.max_length AS varchar(10)) END + ')' \
+                     WHEN t.name IN ('nvarchar', 'nchar') THEN '(' + \
+                       CASE WHEN c.max_length = -1 THEN 'max' ELSE CAST(c.max_length / 2 AS varchar(10)) END + ')' \
+                     WHEN t.name IN ('decimal', 'numeric') THEN \
+                       '(' + CAST(c.precision AS varchar(10)) + ',' + CAST(c.scale AS varchar(10)) + ')' \
+                     ELSE '' END, \
+                   c.is_nullable, CAST(CASE WHEN pk.column_id IS NULL THEN 0 ELSE 1 END AS bit) \
+                 FROM sys.objects o \
+                 JOIN sys.columns c ON c.object_id = o.object_id \
+                 JOIN sys.types t ON t.user_type_id = c.user_type_id \
+                 LEFT JOIN ( \
+                   SELECT ic.object_id, ic.column_id FROM sys.indexes i \
+                   JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id \
+                   WHERE i.is_primary_key = 1 \
+                 ) pk ON pk.object_id = c.object_id AND pk.column_id = c.column_id \
+                 WHERE o.type IN ('U', 'V') AND o.is_ms_shipped = 0 \
+                 ORDER BY o.schema_id, o.name, c.column_id",
+                &[],
+            )
+            .await?;
+        let objects = crate::catalog::group_columns(column_rows.iter().filter_map(|row| {
+            let name = ObjectName {
+                schema: string(row, 0)?,
+                name: string(row, 1)?,
+            };
+            let kind = if string(row, 2)? == "V" {
+                ObjectKind::View
+            } else {
+                ObjectKind::Table
+            };
+            let column = ColumnSummary {
+                name: string(row, 3)?,
+                type_name: string(row, 4).unwrap_or_default(),
+                nullable: row.get::<bool, _>(5).unwrap_or(true),
+                primary_key: row.get::<bool, _>(6).unwrap_or(false),
+            };
+            Some((name, kind, column))
+        }));
+        let key_rows = self
+            .query_rows(
+                "SELECT fk.name, SCHEMA_NAME(pt.schema_id), pt.name, pc.name, \
+                   SCHEMA_NAME(rt.schema_id), rt.name, rc.name \
+                 FROM sys.foreign_keys fk \
+                 JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id \
+                 JOIN sys.objects pt ON pt.object_id = fkc.parent_object_id \
+                 JOIN sys.columns pc ON pc.object_id = fkc.parent_object_id AND pc.column_id = fkc.parent_column_id \
+                 JOIN sys.objects rt ON rt.object_id = fkc.referenced_object_id \
+                 JOIN sys.columns rc ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id \
+                 ORDER BY fk.object_id, fkc.constraint_column_id",
+                &[],
+            )
+            .await?;
+        let foreign_keys = crate::catalog::group_foreign_keys(key_rows.iter().filter_map(|row| {
+            Some((
+                string(row, 0)?,
+                ObjectName {
+                    schema: string(row, 1)?,
+                    name: string(row, 2)?,
+                },
+                string(row, 3)?,
+                ObjectName {
+                    schema: string(row, 4)?,
+                    name: string(row, 5)?,
+                },
+                string(row, 6)?,
+            ))
+        }));
+        Ok(Catalog {
+            default_schema,
+            schemas,
+            objects,
+            foreign_keys,
+        })
+    }
+
+    pub async fn editability(&mut self, sql: &str) -> Result<Editability> {
         let rows = match self
             .query_rows(
                 "EXEC sp_describe_first_result_set @tsql = @P1, @params = NULL, @browse_information_mode = 1",
@@ -340,12 +504,6 @@ impl SqlServerClient {
             .iter()
             .filter(|column| !column.hidden)
             .collect::<Vec<_>>();
-        if visible.len() != result.columns.len() {
-            return Ok(Err(
-                "The result's columns don't match the statement's description.".into(),
-            ));
-        }
-
         let mut tables = Vec::<(Option<String>, String, String)>::new();
         for column in &visible {
             if let (Some(schema), Some(table)) = (&column.source_schema, &column.source_table) {
@@ -517,6 +675,163 @@ impl<T> LogRollbackError for tiberius::Result<T> {
     }
 }
 
+const PACKET_HEADER_LENGTH: usize = 8;
+/// A packet header plus one `DONE` token (type, status, current command, row count).
+const ATTENTION_ACK_LENGTH: usize = PACKET_HEADER_LENGTH + 13;
+const TABULAR_RESULT_PACKET: u8 = 0x04;
+const END_OF_MESSAGE: u8 = 0x01;
+const DONE_TOKEN: u8 = 0xFD;
+const DONE_ATTENTION: u16 = 0x20;
+
+/// Whether `packet` is a whole message holding only the `DONE` that acknowledges an Attention.
+/// Nothing else carries the attention bit, so dropping these can't hide a real reply.
+fn is_attention_ack(packet: &[u8]) -> bool {
+    let [
+        kind,
+        status,
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
+        token,
+        status_low,
+        status_high,
+        ..,
+    ] = packet
+    else {
+        return false;
+    };
+    packet.len() == ATTENTION_ACK_LENGTH
+        && *kind == TABULAR_RESULT_PACKET
+        && status & END_OF_MESSAGE != 0
+        && *token == DONE_TOKEN
+        && u16::from_le_bytes([*status_low, *status_high]) & DONE_ATTENTION != 0
+}
+
+/// Drops the separate Attention acknowledgements that tiberius doesn't read (see
+/// `SqlServerClient::cancel_request`); otherwise one would be taken as the reply to the next
+/// request. It reads whole TDS packets, so it only works on an unencrypted stream, and it
+/// passes bytes through untouched until `enabled` is set after login.
+struct AttentionAckFilter<S> {
+    inner: S,
+    enabled: Arc<AtomicBool>,
+    /// Bytes read from `inner` that don't yet form a whole packet.
+    incoming: Vec<u8>,
+    /// Whole packets waiting to be read, from `ready_start`.
+    ready: Vec<u8>,
+    ready_start: usize,
+    at_end: bool,
+}
+
+impl<S> AttentionAckFilter<S> {
+    fn new(inner: S, enabled: Arc<AtomicBool>) -> Self {
+        Self {
+            inner,
+            enabled,
+            incoming: Vec::new(),
+            ready: Vec::new(),
+            ready_start: 0,
+            at_end: false,
+        }
+    }
+
+    fn take_packets(&mut self) {
+        loop {
+            let [_, _, length_high, length_low, ..] = self.incoming[..] else {
+                return;
+            };
+            let length = usize::from(u16::from_be_bytes([length_high, length_low]));
+            if length < PACKET_HEADER_LENGTH {
+                // Not a TDS packet header: stop interpreting and pass everything through.
+                self.enabled.store(false, Ordering::Release);
+                self.ready.append(&mut self.incoming);
+                return;
+            }
+            if self.incoming.len() < length {
+                return;
+            }
+            let packet = self.incoming.drain(..length).collect::<Vec<_>>();
+            if is_attention_ack(&packet) {
+                log::debug!("dropped a separate Attention acknowledgement");
+            } else {
+                self.ready.extend_from_slice(&packet);
+            }
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for AttentionAckFilter<S> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        loop {
+            if let Some(ready) = this.ready.get(this.ready_start..)
+                && !ready.is_empty()
+            {
+                let count = ready.len().min(buf.len());
+                if let (Some(target), Some(source)) = (buf.get_mut(..count), ready.get(..count)) {
+                    target.copy_from_slice(source);
+                }
+                this.ready_start += count;
+                if this.ready_start >= this.ready.len() {
+                    this.ready.clear();
+                    this.ready_start = 0;
+                }
+                return std::task::Poll::Ready(Ok(count));
+            }
+            if !this.enabled.load(Ordering::Acquire) && this.incoming.is_empty() {
+                return std::pin::Pin::new(&mut this.inner).poll_read(cx, buf);
+            }
+            if this.at_end {
+                if this.incoming.is_empty() {
+                    return std::task::Poll::Ready(Ok(0));
+                }
+                this.ready.append(&mut this.incoming);
+                continue;
+            }
+            let mut chunk = [0; 8192];
+            let count =
+                std::task::ready!(std::pin::Pin::new(&mut this.inner).poll_read(cx, &mut chunk))?;
+            match chunk.get(..count) {
+                Some(read) if !read.is_empty() => {
+                    this.incoming.extend_from_slice(read);
+                    this.take_packets();
+                }
+                _ => this.at_end = true,
+            }
+        }
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for AttentionAckFilter<S> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_close(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_close(cx)
+    }
+}
+
 #[cfg(windows)]
 async fn open_named_pipe(path: &str) -> Result<Box<dyn TdsStream>> {
     use tokio::net::windows::named_pipe::ClientOptions;
@@ -654,6 +969,51 @@ fn type_name(column_type: ColumnType) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drops_only_separate_attention_acknowledgements() {
+        use futures::AsyncReadExt as _;
+
+        // As captured from LocalDB: a cancelled batch's response, then the acknowledgement.
+        let response = [
+            0x04, 0x01, 0x00, 0x15, 0x00, 0x55, 0x01, 0x00, 0xFD, 0x02, 0x00, 0xFD, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let mut acknowledgement = response;
+        acknowledgement[9] = 0x20;
+        let mut reply = response;
+        reply[9] = 0x10;
+        reply[13] = 0x07;
+        let wire = [&response[..], &acknowledgement, &reply].concat();
+
+        // A reader that hands the bytes over a few at a time, splitting packets.
+        struct Trickle(Vec<u8>, usize);
+        impl AsyncRead for Trickle {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                buf: &mut [u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                let start = self.1;
+                let end = (start + 5).min(self.0.len()).min(start + buf.len());
+                buf[..end - start].copy_from_slice(&self.0[start..end]);
+                self.1 = end;
+                std::task::Poll::Ready(Ok(end - start))
+            }
+        }
+
+        let mut filtered = Vec::new();
+        let mut filter =
+            AttentionAckFilter::new(Trickle(wire.clone(), 0), Arc::new(AtomicBool::new(true)));
+        futures::executor::block_on(filter.read_to_end(&mut filtered)).unwrap();
+        assert_eq!(filtered, [&response[..], &reply].concat());
+
+        let mut untouched = Vec::new();
+        let mut disabled =
+            AttentionAckFilter::new(Trickle(wire.clone(), 0), Arc::new(AtomicBool::new(false)));
+        futures::executor::block_on(disabled.read_to_end(&mut untouched)).unwrap();
+        assert_eq!(untouched, wire);
+    }
 
     #[test]
     fn parses_endpoints() {

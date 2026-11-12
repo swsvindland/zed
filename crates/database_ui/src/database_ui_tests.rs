@@ -6,15 +6,15 @@ use std::time::Duration;
 use database::{
     Authentication, ConnectionProfile, ConnectionsFile, DriverKind, PoolKey, StatementOutcome,
 };
-use editor::Editor;
+use editor::{Editor, MultiBufferOffset, SelectionEffects};
 use futures::FutureExt as _;
 use gpui::{AppContext as _, Entity, Focusable as _, TestAppContext, VisualTestContext};
 use project::{FakeFs, Project};
-use tabular_data_preview::types::{AnyColumn, DataCellId, DataRow};
+use tabular_data_preview::types::{AnyColumn, DataCellId, DataRow, TableCell};
 use workspace::{AppState, MultiWorkspace, Workspace};
 
 use crate::{
-    DatabasePanel, DatabaseStore, RunStatement,
+    DatabasePanel, DatabaseStore, RunStatement, StopStatement,
     console::{self, ConsoleTarget},
     database_panel::NodeKey,
     push_modal::PushReviewModal,
@@ -403,4 +403,252 @@ async fn wait_for_results(
     })
     .await;
     found.unwrap()
+}
+
+/// Shows completions with the cursor at `|` in `text`, and returns their labels once one of
+/// them is `expected`.
+async fn completion_labels(
+    editor: &Entity<Editor>,
+    text: &str,
+    expected: &str,
+    cx: &mut VisualTestContext,
+) -> Vec<String> {
+    let offset = text.find('|').expect("a cursor marker");
+    let text = text.replacen('|', "", 1);
+    editor.update_in(cx, |editor, window, cx| {
+        editor.set_text(text.clone(), window, cx);
+        editor.change_selections(SelectionEffects::default(), window, cx, |selections| {
+            selections.select_ranges([MultiBufferOffset(offset)..MultiBufferOffset(offset)])
+        });
+        window.focus(&editor.focus_handle(cx), cx);
+    });
+    let mut labels = Vec::new();
+    wait_until(cx, &format!("a completion for {expected}"), |cx| {
+        labels = editor.update_in(cx, |editor, window, cx| {
+            let labels = editor
+                .current_completions()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|completion| completion.label.text)
+                .collect::<Vec<_>>();
+            if !labels.iter().any(|label| label == expected) {
+                editor.show_completions(&editor::actions::ShowCompletions, window, cx);
+            }
+            labels
+        });
+        labels.iter().any(|label| label == expected)
+    })
+    .await;
+    labels
+}
+
+#[gpui::test]
+async fn test_paging_stop_null_and_completion(cx: &mut TestAppContext) {
+    let Some(mut paged) = profile("ui-test-paged", "dev") else {
+        eprintln!("ZED_DATABASE_TEST_SQL_SERVER not set; skipping");
+        return;
+    };
+    paged.fetch_limit = Some(2);
+    cx.executor().allow_parking();
+    let app_state = cx.update(|cx| {
+        let app_state = AppState::test(cx);
+        editor::init(cx);
+        gpui_tokio::init(cx);
+        crate::init(cx);
+        app_state
+    });
+    let fs = FakeFs::new(cx.executor());
+    let project = Project::test(fs, [], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace =
+        multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+    let _ = app_state;
+
+    let store = cx.update(|_, cx| DatabaseStore::global(cx));
+    store.update(cx, |store, cx| {
+        store.set_connections_for_test(
+            ConnectionsFile {
+                connections: vec![paged.clone()],
+            },
+            cx,
+        )
+    });
+    let master = PoolKey {
+        connection_id: paged.id.clone(),
+        database: "master".into(),
+        session: "setup".into(),
+    };
+    run_sql(
+        &store,
+        master,
+        "IF DB_ID('ZedDatabaseUiTest') IS NULL CREATE DATABASE ZedDatabaseUiTest",
+        cx,
+    )
+    .await;
+    let setup = PoolKey {
+        connection_id: paged.id.clone(),
+        database: DATABASE.into(),
+        session: "setup".into(),
+    };
+    run_sql(
+        &store,
+        setup,
+        "DROP TABLE IF EXISTS dbo.PageOrders;\n\
+         DROP TABLE IF EXISTS dbo.PageCustomers;\n\
+         CREATE TABLE dbo.PageCustomers (Id int PRIMARY KEY, Name nvarchar(50) NULL);\n\
+         CREATE TABLE dbo.PageOrders (Id int PRIMARY KEY, \
+           CustomerId int NOT NULL REFERENCES dbo.PageCustomers (Id), Note nvarchar(20) NULL);\n\
+         INSERT INTO dbo.PageCustomers VALUES \
+           (1, N'Ada'), (2, NULL), (3, N''), (4, N'Grace'), (5, N'Linus')",
+        cx,
+    )
+    .await;
+
+    let editor = workspace.update_in(cx, |workspace, window, cx| {
+        let buffer = project.update(cx, |project, cx| {
+            project.create_local_buffer(
+                "SELECT Id, Name FROM dbo.PageCustomers ORDER BY Id",
+                None,
+                false,
+                cx,
+            )
+        });
+        let editor = cx.new(|cx| Editor::for_buffer(buffer, Some(project.clone()), window, cx));
+        workspace.add_item_to_active_pane(Box::new(editor.clone()), None, true, window, cx);
+        editor
+    });
+    cx.update(|_, cx| {
+        console::bind_editor(
+            &editor,
+            ConsoleTarget {
+                connection_id: paged.id.clone(),
+                database: DATABASE.into(),
+            },
+            cx,
+        )
+    });
+
+    // Paging: the fetch limit of 2 stops the grid at each page until asked for more.
+    cx.dispatch_action(RunStatement);
+    let results = wait_for_results(&workspace, cx).await;
+    wait_until(cx, "the first page", |cx| {
+        results.read_with(cx, |results, _| results.is_paused_for_test())
+    })
+    .await;
+    results.read_with(cx, |results, _| {
+        let (rows, editable) = results.summary_for_test();
+        assert_eq!(rows, vec![2]);
+        assert!(editable.is_ok(), "{editable:?}");
+    });
+    results.update_in(cx, |results, window, cx| {
+        results.fetch_for_test(false, window, cx)
+    });
+    wait_until(cx, "the second page", |cx| {
+        results.read_with(cx, |results, _| {
+            results.is_paused_for_test() && results.summary_for_test().0 == vec![4]
+        })
+    })
+    .await;
+    results.update_in(cx, |results, window, cx| {
+        results.fetch_for_test(true, window, cx)
+    });
+    wait_until(cx, "every row", |cx| {
+        results.read_with(cx, |results, _| {
+            !results.is_busy_for_test() && results.summary_for_test().0 == vec![5]
+        })
+    })
+    .await;
+
+    // NULL and the empty string are different cells.
+    results.read_with(cx, |results, cx| {
+        assert!(matches!(
+            results.grid_cell_for_test(0, 1, 1, cx),
+            Some(TableCell::Null)
+        ));
+        assert!(matches!(
+            results.grid_cell_for_test(0, 2, 1, cx),
+            Some(TableCell::Generated(text)) if text.is_empty()
+        ));
+        assert_eq!(results.value_for_test(0, 1, 1), Some(None));
+        assert_eq!(results.value_for_test(0, 2, 1), Some(Some(String::new())));
+    });
+    // Opening a NULL cell's editor and leaving it unchanged keeps it NULL.
+    let table = results.read_with(cx, |results, _| results.table_for_test(0));
+    table.update_in(cx, |table, window, cx| {
+        table.select_cell(DataCellId::new(DataRow(1), AnyColumn(1)), cx);
+        window.focus(&table.focus_handle(cx), cx);
+    });
+    cx.simulate_keystrokes("f2");
+    cx.dispatch_action(menu::Confirm);
+    results.read_with(cx, |results, _| {
+        assert_eq!(results.pending_row_count(), 0);
+        assert_eq!(results.value_for_test(0, 1, 1), Some(None));
+    });
+
+    // Stop cancels a statement the server is still running, and the session stays usable.
+    editor.update_in(cx, |editor, window, cx| {
+        editor.set_text("WAITFOR DELAY '00:00:30'", window, cx);
+        window.focus(&editor.focus_handle(cx), cx);
+    });
+    cx.dispatch_action(RunStatement);
+    wait_until(cx, "the slow statement to start", |cx| {
+        results.read_with(cx, |results, _| results.is_busy_for_test())
+    })
+    .await;
+    std::thread::sleep(Duration::from_millis(500));
+    cx.update(|window, cx| window.focus(&editor.focus_handle(cx), cx));
+    let stopping = std::time::Instant::now();
+    cx.dispatch_action(StopStatement);
+    wait_until(cx, "the statement to stop", |cx| {
+        results.read_with(cx, |results, _| {
+            results.stopped_reason_for_test().as_deref() == Some("Stopped")
+        })
+    })
+    .await;
+    assert!(stopping.elapsed() < Duration::from_secs(15));
+    editor.update_in(cx, |editor, window, cx| {
+        editor.set_text("SELECT COUNT(*) AS n FROM dbo.PageCustomers", window, cx);
+        window.focus(&editor.focus_handle(cx), cx);
+    });
+    cx.dispatch_action(RunStatement);
+    wait_until(cx, "a query after the stop", |cx| {
+        results.read_with(cx, |results, _| {
+            !results.is_busy_for_test() && results.value_for_test(0, 0, 0) == Some(Some("5".into()))
+        })
+    })
+    .await;
+
+    // Completion: an alias's columns, a join from the foreign key, and new columns after DDL.
+    let labels = completion_labels(
+        &editor,
+        "SELECT o.| FROM dbo.PageOrders o",
+        "CustomerId",
+        cx,
+    )
+    .await;
+    assert!(labels.iter().any(|label| label == "Note"), "{labels:?}");
+    completion_labels(
+        &editor,
+        "SELECT * FROM dbo.PageOrders o JOIN |",
+        "PageCustomers pc ON pc.Id = o.CustomerId",
+        cx,
+    )
+    .await;
+    editor.update_in(cx, |editor, window, cx| {
+        editor.set_text("ALTER TABLE dbo.PageOrders ADD Extra int NULL", window, cx);
+        window.focus(&editor.focus_handle(cx), cx);
+    });
+    cx.dispatch_action(RunStatement);
+    wait_until(cx, "the ALTER TABLE", |cx| {
+        results.read_with(cx, |results, _| {
+            !results.is_busy_for_test()
+                && results
+                    .messages_for_test()
+                    .iter()
+                    .any(|message| message.starts_with("Finished"))
+        })
+    })
+    .await;
+    completion_labels(&editor, "SELECT o.| FROM dbo.PageOrders o", "Extra", cx).await;
 }

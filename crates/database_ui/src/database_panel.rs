@@ -572,6 +572,12 @@ impl DatabasePanel {
     }
 
     fn refresh_node(&mut self, key: &NodeKey, cx: &mut Context<Self>) {
+        if let Some(connection_id) = key.connection_id() {
+            let database = key.database().map(ToOwned::to_owned);
+            DatabaseStore::global(cx).update(cx, |store, _| {
+                store.invalidate_catalog(connection_id, database.as_deref())
+            });
+        }
         let mut stale = vec![key.clone()];
         while let Some(stale_key) = stale.pop() {
             if let Some(Children::Loaded(nodes)) = self.children.remove(&stale_key) {
