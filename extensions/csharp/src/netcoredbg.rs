@@ -1,9 +1,10 @@
 use std::fs;
 
-use zed_extension_api::{self as zed, Result, serde_json};
+use zed_extension_api::{self as zed, Result};
 
-use crate::roslyn::{
-    absolute_path, make_executable, newest_installed_version, remove_other_versions,
+use crate::{
+    dap_config,
+    roslyn::{absolute_path, make_executable, newest_installed_version, remove_other_versions},
 };
 
 const REPOSITORY: &str = "Samsung/netcoredbg";
@@ -22,9 +23,7 @@ impl Netcoredbg {
         user_provided_path: Option<String>,
         worktree: &zed::Worktree,
     ) -> Result<zed::DebugAdapterBinary> {
-        let configuration: serde_json::Value = serde_json::from_str(&config.config)
-            .map_err(|error| format!("invalid netcoredbg configuration: {error}"))?;
-        let request = Self::request_kind(&configuration)?;
+        let request = dap_config::parse(Self::ADAPTER_NAME, &config)?;
 
         let command = match user_provided_path.or_else(|| worktree.which(Self::ADAPTER_NAME)) {
             Some(path) => path,
@@ -102,60 +101,6 @@ impl Netcoredbg {
         let path = absolute_path(&relative_path)?;
         self.cached_path = Some(path.clone());
         Ok(path)
-    }
-
-    pub fn request_kind(
-        configuration: &serde_json::Value,
-    ) -> Result<zed::StartDebuggingRequestArgumentsRequest> {
-        match configuration
-            .get("request")
-            .and_then(|request| request.as_str())
-        {
-            Some("launch") => Ok(zed::StartDebuggingRequestArgumentsRequest::Launch),
-            Some("attach") => Ok(zed::StartDebuggingRequestArgumentsRequest::Attach),
-            Some(other) => Err(format!(
-                "invalid request '{other}', expected 'launch' or 'attach'"
-            )),
-            None => Err("missing 'request' (expected 'launch' or 'attach')".to_string()),
-        }
-    }
-
-    pub fn config_to_scenario(config: zed::DebugConfig) -> Result<zed::DebugScenario> {
-        let configuration = match config.request {
-            zed::DebugRequest::Launch(launch) => {
-                let environment = launch
-                    .envs
-                    .into_iter()
-                    .map(|(key, value)| (key, serde_json::Value::String(value)))
-                    .collect::<serde_json::Map<_, _>>();
-                let mut configuration = serde_json::json!({
-                    "request": "launch",
-                    "program": launch.program,
-                    "args": launch.args,
-                    "env": environment,
-                    "stopAtEntry": config.stop_on_entry.unwrap_or(false),
-                });
-                if let Some(cwd) = launch.cwd {
-                    configuration["cwd"] = serde_json::Value::String(cwd);
-                }
-                configuration
-            }
-            zed::DebugRequest::Attach(attach) => {
-                let mut configuration = serde_json::json!({ "request": "attach" });
-                if let Some(process_id) = attach.process_id {
-                    configuration["processId"] = serde_json::Value::from(process_id);
-                }
-                configuration
-            }
-        };
-
-        Ok(zed::DebugScenario {
-            label: config.label,
-            adapter: config.adapter,
-            build: None,
-            config: configuration.to_string(),
-            tcp_connection: None,
-        })
     }
 }
 

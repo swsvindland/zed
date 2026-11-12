@@ -13,4 +13,4 @@ brackets = [
     { start = "'", end = "'", close = true, newline = false, not_in = ["string", "comment"] },
     { start = "/*", end = " */", close = true, newline = false, not_in = ["string", "comment"] },
 ]
-debuggers = ["netcoredbg"]
+debuggers = ["netcoredbg", "dotnet-debugger"]

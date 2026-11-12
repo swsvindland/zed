@@ -9,20 +9,42 @@ use serde::Deserialize;
 use task::{BuildTaskDefinition, DebugScenario, LaunchRequest, SpawnInTerminal, TaskTemplate};
 
 use crate::msbuild::{
-    LaunchProfile, MsBuildProject, RunConfiguration, RunKind, is_project_file,
-    parse_launch_profile, split_command_line,
+    CommandLine, LaunchProfile, MsBuildProject, RunConfiguration, RunKind,
+    executable_output_directory, executable_path, is_net_framework, is_project_file,
+    parse_launch_profile, parse_project, split_command_line,
 };
 
 /// The debug adapter the C# extension registers for .NET (Core) programs.
-pub const ADAPTER_NAME: &str = "netcoredbg";
+pub const NETCOREDBG: &str = "netcoredbg";
+/// The debug adapter the C# extension registers for .NET Framework programs, which netcoredbg
+/// can't debug. It debugs .NET 8 and later as well, but only 64-bit processes.
+pub const DOTNET_DEBUGGER: &str = "dotnet-debugger";
 pub const LOCATOR_NAME: &str = "dotnet-locator";
 
 /// Carries the launch profile from `dotnet run` to the locator through the build task, whose
 /// arguments `dotnet build` would reject. `NO_LAUNCH_PROFILE` stands for `--no-launch-profile`.
 const LAUNCH_PROFILE_VARIABLE: &str = "ZED_DOTNET_LAUNCH_PROFILE";
 const NO_LAUNCH_PROFILE: &str = "";
+/// Tells the locator which adapter the scenario was created for, which is decided before the
+/// build tells which framework the program targets.
+const ADAPTER_VARIABLE: &str = "ZED_DOTNET_DEBUG_ADAPTER";
 
-/// Turns `dotnet run` tasks into netcoredbg debug scenarios: the scenario builds the project with
+/// The adapter for a program that targets `framework`: dotnet-debugger for the .NET Framework,
+/// and otherwise `preferred`, the first debugger of the C# language (netcoredbg, unless the
+/// user prefers dotnet-debugger).
+pub fn adapter_for(framework: Option<&str>, preferred: &str) -> &'static str {
+    if preferred == DOTNET_DEBUGGER || framework.is_some_and(is_net_framework) {
+        DOTNET_DEBUGGER
+    } else {
+        NETCOREDBG
+    }
+}
+
+fn is_dotnet_adapter(adapter: &str) -> bool {
+    adapter == NETCOREDBG || adapter == DOTNET_DEBUGGER
+}
+
+/// Turns `dotnet run` tasks into debug scenarios: the scenario builds the project with
 /// `dotnet build`, then asks MSBuild where the program is and applies the `launchSettings.json`
 /// profile `dotnet run` would have used.
 pub struct DotnetLocator;
@@ -39,10 +61,16 @@ impl DapLocator for DotnetLocator {
         resolved_label: &str,
         adapter: &DebugAdapterName,
     ) -> Option<DebugScenario> {
-        if adapter.as_ref() != ADAPTER_NAME || !is_dotnet(&build_config.command) {
+        if !is_dotnet_adapter(adapter.as_ref()) || !is_dotnet(&build_config.command) {
             return None;
         }
         let run_arguments = RunArguments::parse(&build_config.args)?;
+        let framework = run_arguments.framework.clone().or_else(|| {
+            let cwd = build_config.cwd.as_deref()?;
+            target_framework(Path::new(cwd), run_arguments.project.as_deref())
+        });
+        let adapter = adapter_for(framework.as_deref(), adapter.as_ref());
+
         let mut build_task = TaskTemplate {
             label: format!("Build for {resolved_label}"),
             command: build_config.command.clone(),
@@ -56,8 +84,11 @@ impl DapLocator for DotnetLocator {
                 .env
                 .insert(LAUNCH_PROFILE_VARIABLE.to_owned(), launch_profile);
         }
+        build_task
+            .env
+            .insert(ADAPTER_VARIABLE.to_owned(), adapter.to_owned());
         Some(DebugScenario {
-            adapter: adapter.0.clone(),
+            adapter: adapter.into(),
             label: resolved_label.to_owned().into(),
             build: Some(BuildTaskDefinition::Template {
                 task_template: build_task,
@@ -85,12 +116,48 @@ impl DapLocator for DotnetLocator {
             name => load_launch_profile(&project_path, name)?,
         };
         let output = query_output(&project_path, &build_arguments).await?;
+        let adapter = build_config
+            .env
+            .get(ADAPTER_VARIABLE)
+            .map_or(NETCOREDBG, String::as_str);
+        check_adapter(adapter, &project_path, &output)?;
         Ok(DebugRequest::Launch(launch_request(output, launch_profile)))
     }
 }
 
-/// The debug scenario that debugs `configuration` the way `dotnet: run` runs it.
-pub fn debug_scenario(
+/// The framework a `dotnet run` task in `cwd` would build, when the project can be found without
+/// the task's variables (`$ZED_DIRNAME`) resolved.
+fn target_framework(cwd: &Path, project: Option<&str>) -> Option<String> {
+    if cwd.to_string_lossy().contains('$') || project.is_some_and(|project| project.contains('$')) {
+        return None;
+    }
+    let project_path = find_project(cwd, project).ok()?;
+    let contents = std::fs::read_to_string(&project_path).ok()?;
+    let project = parse_project(&project_path, &contents).ok()?;
+    // Like `query_output`, a multi-targeting project is debugged in its first framework.
+    project.target_frameworks.into_iter().next()
+}
+
+/// Fails with an explanation when netcoredbg was picked for a .NET Framework program, which
+/// happens when the locator couldn't read the project before the build.
+fn check_adapter(adapter: &str, project_path: &Path, output: &ProjectOutput) -> Result<()> {
+    if adapter == NETCOREDBG && is_net_framework(&output.target_framework) {
+        let name = project_path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        bail!(
+            "{name} targets {}, which netcoredbg can't debug. Start it with `dotnet: debug`, or \
+             make dotnet-debugger the C# debugger with \"languages\": {{ \"C#\": {{ \
+             \"debuggers\": [\"dotnet-debugger\"] }} }}",
+            output.target_framework
+        );
+    }
+    Ok(())
+}
+
+/// The debug scenario that debugs a `dotnet run` configuration the way `dotnet: run` runs it.
+pub fn dotnet_run_scenario(
     configuration: &RunConfiguration,
     project: &MsBuildProject,
 ) -> Result<DebugScenario> {
@@ -99,11 +166,12 @@ pub fn debug_scenario(
         framework,
     } = &configuration.kind
     else {
-        bail!(
-            "{} targets the .NET Framework, which netcoredbg can't debug",
-            configuration.label()
-        );
+        bail!("{} is not started with dotnet run", configuration.label());
     };
+    let target_framework = framework
+        .as_deref()
+        .or_else(|| project.target_frameworks.first().map(String::as_str));
+    let adapter = adapter_for(target_framework, NETCOREDBG);
 
     let mut args = vec![
         "build".to_owned(),
@@ -119,8 +187,9 @@ pub fn debug_scenario(
             .clone()
             .unwrap_or_else(|| NO_LAUNCH_PROFILE.to_owned()),
     );
+    env.insert(ADAPTER_VARIABLE.to_owned(), adapter.to_owned());
     Ok(DebugScenario {
-        adapter: ADAPTER_NAME.into(),
+        adapter: adapter.into(),
         label: format!("Debug {}", configuration.label()).into(),
         build: Some(BuildTaskDefinition::Template {
             task_template: TaskTemplate {
@@ -136,6 +205,48 @@ pub fn debug_scenario(
         config: serde_json::Value::Null,
         tcp_connection: None,
     })
+}
+
+/// The debug scenario for a legacy executable: `build` (MSBuild.exe) builds it, then
+/// dotnet-debugger starts it from its output directory, as Visual Studio does.
+pub fn executable_scenario(
+    configuration: &RunConfiguration,
+    project: &MsBuildProject,
+    build: CommandLine,
+) -> DebugScenario {
+    DebugScenario {
+        adapter: DOTNET_DEBUGGER.into(),
+        label: format!("Debug {}", configuration.label()).into(),
+        build: Some(BuildTaskDefinition::Template {
+            task_template: TaskTemplate {
+                label: format!("Build {}", project.name),
+                command: build.program,
+                args: build.args,
+                cwd: Some(project.directory().to_string_lossy().into_owned()),
+                ..TaskTemplate::default()
+            },
+            locator_name: None,
+        }),
+        config: serde_json::json!({
+            "request": "launch",
+            "program": executable_path(project),
+            "cwd": executable_output_directory(project),
+            "args": [],
+            "env": {},
+        }),
+        tcp_connection: None,
+    }
+}
+
+/// The debug scenario that attaches dotnet-debugger to a running process.
+pub fn attach_scenario(label: String, process_id: u32) -> DebugScenario {
+    DebugScenario {
+        adapter: DOTNET_DEBUGGER.into(),
+        label: label.into(),
+        build: None,
+        config: serde_json::json!({ "request": "attach", "processId": process_id }),
+        tcp_connection: None,
+    }
 }
 
 fn is_dotnet(command: &str) -> bool {
@@ -291,6 +402,8 @@ struct ProjectOutput {
     #[serde(default)]
     run_working_directory: String,
     #[serde(default)]
+    target_framework: String,
+    #[serde(default)]
     target_frameworks: String,
     #[serde(skip)]
     project_directory: PathBuf,
@@ -341,6 +454,7 @@ async fn msbuild_properties(
             "-nologo",
             "-getProperty:TargetPath",
             "-getProperty:RunWorkingDirectory",
+            "-getProperty:TargetFramework",
             "-getProperty:TargetFrameworks",
         ])
         .current_dir(project_path.parent().unwrap_or(Path::new(".")));
@@ -495,6 +609,194 @@ mod tests {
                 .get("ASPNETCORE_ENVIRONMENT")
                 .map(String::as_str),
             Some("Development")
+        );
+    }
+
+    fn adapter_of(scenario: &DebugScenario) -> &str {
+        scenario.adapter.as_ref()
+    }
+
+    fn build_env(scenario: &DebugScenario) -> &HashMap<String, String> {
+        match &scenario.build {
+            Some(BuildTaskDefinition::Template { task_template, .. }) => &task_template.env,
+            other => panic!("unexpected build: {other:?}"),
+        }
+    }
+
+    fn dotnet_run_task(args: &[&str], cwd: Option<&Path>) -> TaskTemplate {
+        TaskTemplate {
+            label: "dotnet run".into(),
+            command: "dotnet".into(),
+            args: strings(args),
+            cwd: cwd.map(|cwd| cwd.to_string_lossy().into_owned()),
+            ..TaskTemplate::default()
+        }
+    }
+
+    fn create_scenario(task: &TaskTemplate, adapter: &str) -> Option<DebugScenario> {
+        futures::executor::block_on(DotnetLocator.create_scenario(
+            task,
+            "dotnet run",
+            &DebugAdapterName(adapter.to_owned().into()),
+        ))
+    }
+
+    #[test]
+    fn picks_the_adapter_by_target_framework() {
+        assert_eq!(adapter_for(Some("net8.0"), NETCOREDBG), NETCOREDBG);
+        assert_eq!(adapter_for(None, NETCOREDBG), NETCOREDBG);
+        assert_eq!(adapter_for(Some("net48"), NETCOREDBG), DOTNET_DEBUGGER);
+        assert_eq!(adapter_for(Some("net472"), NETCOREDBG), DOTNET_DEBUGGER);
+        assert_eq!(
+            adapter_for(Some("net8.0"), DOTNET_DEBUGGER),
+            DOTNET_DEBUGGER
+        );
+    }
+
+    #[test]
+    fn locator_picks_the_adapter_for_the_project() {
+        let directory = tempfile::tempdir().unwrap();
+        let framework_directory = directory.path().join("Tool");
+        let core_directory = directory.path().join("Api");
+        std::fs::create_dir_all(&framework_directory).unwrap();
+        std::fs::create_dir_all(&core_directory).unwrap();
+        std::fs::write(
+            framework_directory.join("Tool.csproj"),
+            r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net48</TargetFramework></PropertyGroup></Project>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            core_directory.join("Api.csproj"),
+            r#"<Project Sdk="Microsoft.NET.Sdk.Web"><PropertyGroup><TargetFrameworks>net8.0;net48</TargetFrameworks></PropertyGroup></Project>"#,
+        )
+        .unwrap();
+
+        let scenario = create_scenario(
+            &dotnet_run_task(&["run"], Some(&framework_directory)),
+            NETCOREDBG,
+        )
+        .unwrap();
+        assert_eq!(adapter_of(&scenario), DOTNET_DEBUGGER);
+        assert_eq!(
+            build_env(&scenario)
+                .get(ADAPTER_VARIABLE)
+                .map(String::as_str),
+            Some(DOTNET_DEBUGGER)
+        );
+
+        // `--project` is relative to the task's working directory; a multi-targeting project is
+        // debugged in its first framework unless the task picks one.
+        let api_task = |framework: &[&str]| {
+            let mut args = vec!["run", "--project", "Api/Api.csproj"];
+            args.extend(framework);
+            dotnet_run_task(&args, Some(directory.path()))
+        };
+        let scenario = create_scenario(&api_task(&[]), NETCOREDBG).unwrap();
+        assert_eq!(adapter_of(&scenario), NETCOREDBG);
+        let scenario = create_scenario(&api_task(&["--framework", "net48"]), NETCOREDBG).unwrap();
+        assert_eq!(adapter_of(&scenario), DOTNET_DEBUGGER);
+        let scenario = create_scenario(&api_task(&[]), DOTNET_DEBUGGER).unwrap();
+        assert_eq!(adapter_of(&scenario), DOTNET_DEBUGGER);
+
+        // Before the task's variables are resolved, the project can't be found.
+        let unresolved = dotnet_run_task(&["run"], Some(Path::new("$ZED_DIRNAME")));
+        let scenario = create_scenario(&unresolved, NETCOREDBG).unwrap();
+        assert_eq!(adapter_of(&scenario), NETCOREDBG);
+        assert_eq!(
+            build_env(&scenario)
+                .get(ADAPTER_VARIABLE)
+                .map(String::as_str),
+            Some(NETCOREDBG)
+        );
+
+        assert!(create_scenario(&unresolved, "codelldb").is_none());
+        assert!(create_scenario(&dotnet_run_task(&["test"], None), NETCOREDBG).is_none());
+    }
+
+    #[test]
+    fn rejects_netcoredbg_for_the_net_framework() {
+        let project_path = PathBuf::from("work").join("Tool").join("Tool.csproj");
+        let output = |framework: &str| ProjectOutput {
+            target_path: "Tool.exe".into(),
+            target_framework: framework.into(),
+            ..ProjectOutput::default()
+        };
+        let error = check_adapter(NETCOREDBG, &project_path, &output("net48")).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("Tool targets net48, which netcoredbg can't debug"),
+            "{error}"
+        );
+        check_adapter(DOTNET_DEBUGGER, &project_path, &output("net48")).unwrap();
+        check_adapter(NETCOREDBG, &project_path, &output("net8.0")).unwrap();
+    }
+
+    #[test]
+    fn builds_scenarios_for_run_configurations() {
+        let directory = if cfg!(windows) {
+            PathBuf::from("C:\\work\\Tool")
+        } else {
+            PathBuf::from("/work/Tool")
+        };
+        let sdk_project = parse_project(
+            &directory.join("Tool.csproj"),
+            r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net48</TargetFramework></PropertyGroup></Project>"#,
+        )
+        .unwrap();
+        let configurations = crate::msbuild::run_configurations(&sdk_project, true);
+        let scenario = dotnet_run_scenario(&configurations[0], &sdk_project).unwrap();
+        assert_eq!(adapter_of(&scenario), DOTNET_DEBUGGER);
+        assert_eq!(scenario.label.as_ref(), "Debug Tool");
+
+        let legacy_project = parse_project(
+            &directory.join("Tool.csproj"),
+            r#"<Project ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+                 <PropertyGroup><OutputType>Exe</OutputType><TargetFrameworkVersion>v4.8</TargetFrameworkVersion></PropertyGroup>
+                 <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' "><OutputPath>bin\Debug\</OutputPath></PropertyGroup>
+               </Project>"#,
+        )
+        .unwrap();
+        let configuration = &crate::msbuild::run_configurations(&legacy_project, true)[0];
+        assert_eq!(configuration.kind, RunKind::Executable);
+        assert!(dotnet_run_scenario(configuration, &legacy_project).is_err());
+        let build = CommandLine {
+            program: "C:\\MSBuild\\MSBuild.exe".into(),
+            args: strings(&["Tool.csproj", "-p:Configuration=Debug"]),
+        };
+        let scenario = executable_scenario(configuration, &legacy_project, build);
+        assert_eq!(adapter_of(&scenario), DOTNET_DEBUGGER);
+        let output_directory = executable_output_directory(&legacy_project);
+        assert_eq!(
+            scenario.config,
+            serde_json::json!({
+                "request": "launch",
+                "program": output_directory.join("Tool.exe"),
+                "cwd": output_directory,
+                "args": [],
+                "env": {},
+            })
+        );
+        match &scenario.build {
+            Some(BuildTaskDefinition::Template {
+                task_template,
+                locator_name,
+            }) => {
+                assert_eq!(task_template.command, "C:\\MSBuild\\MSBuild.exe");
+                assert_eq!(
+                    task_template.args,
+                    strings(&["Tool.csproj", "-p:Configuration=Debug"])
+                );
+                assert_eq!(*locator_name, None);
+            }
+            other => panic!("unexpected build: {other:?}"),
+        }
+
+        let attach = attach_scenario("Debug Site (IIS Express)".into(), 4242);
+        assert_eq!(adapter_of(&attach), DOTNET_DEBUGGER);
+        assert_eq!(
+            attach.config,
+            serde_json::json!({ "request": "attach", "processId": 4242 })
         );
     }
 }

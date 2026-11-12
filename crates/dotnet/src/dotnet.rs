@@ -7,21 +7,24 @@ use std::{
     borrow::Cow,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result, anyhow, bail};
 use dap::DapRegistry;
 use db::kvp::KeyValueStore;
 use fs::Fs;
-use futures::StreamExt as _;
+use futures::{StreamExt as _, channel::oneshot};
 use gpui::{
-    App, AppContext as _, Context, Entity, IntoElement, ParentElement, Render, Styled,
-    Subscription, Task, WeakEntity, Window, actions, div, prelude::FluentBuilder as _,
+    App, AppContext as _, AsyncWindowContext, Context, Entity, IntoElement, ParentElement, Render,
+    Styled, Subscription, Task, WeakEntity, Window, actions, div,
 };
-use project::{Project, TaskSourceKind};
+use project::{Project, TaskSourceKind, WorktreeId};
 use project_panel::ProjectView;
-use task::{RevealStrategy, SaveStrategy, SharedTaskContext, TaskContext, TaskTemplate};
+use sysinfo::{ProcessRefreshKind, RefreshKind, System, UpdateKind};
+use task::{
+    DebugScenario, RevealStrategy, SaveStrategy, SharedTaskContext, TaskContext, TaskTemplate,
+};
 use ui::{
     Button, ButtonCommon, Clickable, IconButton, IconName, IconSize, LabelSize, Tooltip, h_flex,
 };
@@ -30,7 +33,7 @@ use util::{
     rel_path::RelPath,
     shell::{ShellKind, get_system_shell},
 };
-use workspace::{StatusItemView, Workspace, item::ItemHandle};
+use workspace::{StatusItemView, Workspace, item::ItemHandle, tasks::ScheduledTaskResult};
 
 pub use msbuild::{
     BuildVerb, MsBuildProject, OutputType, PackageReference, ProjectStyle, RunConfiguration,
@@ -38,9 +41,9 @@ pub use msbuild::{
 };
 use msbuild::{
     CommandLine, IisExpressSite, dotnet_build_command, dotnet_run_command,
-    executable_output_directory, executable_path, find_iis_express_site_name, iis_express_command,
-    is_project_file, msbuild_command, parse_launch_settings,
-    parse_packages_config, parse_project, parse_solution,
+    executable_output_directory, executable_path, find_iis_express_site_name,
+    iis_express_32_bit_reason, iis_express_command, is_project_file, msbuild_command,
+    parse_launch_settings, parse_packages_config, parse_project, parse_solution,
 };
 use run_configuration_picker::RunConfigurationPicker;
 use solution_view::SolutionView;
@@ -153,29 +156,205 @@ fn debug_configuration(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    let scenario = projects
+    let worktree_id = workspace
+        .project()
         .read(cx)
-        .project(&configuration.project_path)
-        .context("the project is no longer part of this workspace")
-        .and_then(|project| debug::debug_scenario(&configuration, project));
-    match scenario {
-        Ok(scenario) => {
-            let worktree_id = workspace
-                .project()
-                .read(cx)
-                .find_worktree(&configuration.project_path, cx)
-                .map(|(worktree, _)| worktree.read(cx).id());
-            workspace.start_debug_session(
-                scenario,
-                SharedTaskContext::default(),
-                None,
-                worktree_id,
-                window,
-                cx,
+        .find_worktree(&configuration.project_path, cx)
+        .map(|(worktree, _)| worktree.read(cx).id());
+    let plan = projects.update(cx, |projects, cx| projects.debug_plan(configuration, cx));
+    cx.spawn_in(window, async move |workspace, cx| {
+        let result = match plan.await {
+            Ok(DebugPlan::Launch(scenario)) => workspace.update_in(cx, |workspace, window, cx| {
+                workspace.start_debug_session(
+                    scenario,
+                    SharedTaskContext::default(),
+                    None,
+                    worktree_id,
+                    window,
+                    cx,
+                );
+            }),
+            Ok(DebugPlan::IisExpress(plan)) => {
+                debug_iis_express(plan, worktree_id, workspace.clone(), cx).await
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            workspace
+                .update(cx, |workspace, cx| workspace.show_error(error, cx))
+                .log_err();
+        }
+    })
+    .detach();
+}
+
+/// How `dotnet: debug` starts a run configuration.
+enum DebugPlan {
+    /// A debug session that builds the program and launches it.
+    Launch(DebugScenario),
+    /// Serves a web project with IIS Express, then attaches to it.
+    IisExpress(IisExpressDebugPlan),
+}
+
+struct IisExpressDebugPlan {
+    label: String,
+    /// Builds the project and starts IIS Express, as `dotnet: run` does.
+    run: CommandPlan,
+    iis_express: PathBuf,
+    /// The argument that tells this site's IIS Express process apart (`/site:…` or `/path:…`).
+    site_argument: String,
+}
+
+/// IIS Express loads the CLR a few hundred milliseconds after it starts; attaching earlier fails.
+const CLR_LOAD_TIMEOUT: Duration = Duration::from_secs(30);
+const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Runs `plan` in a terminal like `dotnet: run`, waits for its IIS Express process to load the
+/// CLR, and attaches dotnet-debugger to it. Stopping the debug session stops IIS Express.
+async fn debug_iis_express(
+    plan: IisExpressDebugPlan,
+    worktree_id: Option<WorktreeId>,
+    workspace: WeakEntity<Workspace>,
+    cx: &mut AsyncWindowContext,
+) -> Result<()> {
+    let IisExpressDebugPlan {
+        label,
+        run,
+        iis_express,
+        site_argument,
+    } = plan;
+    let project_name = run
+        .source_path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let started_at = unix_time_seconds();
+    let (finished_tx, mut finished_rx) = oneshot::channel();
+    workspace.update_in(cx, |workspace, window, cx| {
+        schedule_plan_with_completion(
+            run,
+            move |result, _| {
+                finished_tx.send(result).ok();
+            },
+            workspace,
+            window,
+            cx,
+        )
+    })??;
+
+    // The task ended (the build failed, IIS Express exited, or the task was stopped or never
+    // spawned) before the debugger could attach.
+    let mut ended = move || {
+        let reason = match finished_rx.try_recv() {
+            Ok(None) => return None,
+            Ok(Some(ScheduledTaskResult::Failure)) => "the build failed or IIS Express exited",
+            Ok(Some(ScheduledTaskResult::Success)) => "IIS Express exited",
+            Ok(Some(ScheduledTaskResult::Cancelled)) => "the task was stopped",
+            Ok(Some(ScheduledTaskResult::SpawnFailed)) | Err(_) => "the task could not start",
+        };
+        Some(anyhow!(
+            "Debugging {project_name} in IIS Express stopped before the debugger attached: \
+             {reason}. See the terminal."
+        ))
+    };
+    let process_id = loop {
+        if let Some(error) = ended() {
+            return Err(error);
+        }
+        let iis_express = iis_express.clone();
+        let site_argument = site_argument.clone();
+        let process_id = cx
+            .background_spawn(async move {
+                find_iis_express_process(&iis_express, &site_argument, started_at)
+            })
+            .await;
+        if let Some(process_id) = process_id {
+            break process_id;
+        }
+        cx.background_executor().timer(PROCESS_POLL_INTERVAL).await;
+    };
+
+    let waiting_since = Instant::now();
+    while !has_clr(process_id).await {
+        if let Some(error) = ended() {
+            return Err(error);
+        }
+        if waiting_since.elapsed() > CLR_LOAD_TIMEOUT {
+            bail!(
+                "IIS Express (process {process_id}) did not load the .NET Framework 4 runtime \
+                 within {} seconds, so the debugger was not attached",
+                CLR_LOAD_TIMEOUT.as_secs()
             );
         }
-        Err(error) => workspace.show_error(error, cx),
+        cx.background_executor().timer(PROCESS_POLL_INTERVAL).await;
     }
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.start_debug_session(
+            debug::attach_scenario(label, process_id),
+            SharedTaskContext::default(),
+            None,
+            worktree_id,
+            window,
+            cx,
+        );
+    })
+}
+
+fn unix_time_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+/// The newest `iis_express` process serving the site that was started after `started_at`.
+fn find_iis_express_process(
+    iis_express: &Path,
+    site_argument: &str,
+    started_at: u64,
+) -> Option<u32> {
+    let refresh_kind = RefreshKind::nothing().with_processes(
+        ProcessRefreshKind::nothing()
+            .without_tasks()
+            .with_exe(UpdateKind::Always)
+            .with_cmd(UpdateKind::Always),
+    );
+    System::new_with_specifics(refresh_kind)
+        .processes()
+        .values()
+        .filter(|process| {
+            process
+                .name()
+                .to_string_lossy()
+                .eq_ignore_ascii_case("iisexpress.exe")
+        })
+        // Process start times have a resolution of one second.
+        .filter(|process| process.start_time() + 1 >= started_at)
+        .filter(|process| process.exe().is_some_and(|exe| same_path(exe, iis_express)))
+        .filter(|process| {
+            process.cmd().iter().any(|argument| {
+                argument
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(site_argument)
+            })
+        })
+        .max_by_key(|process| process.start_time())
+        .map(|process| process.pid().as_u32())
+}
+
+/// Whether the process has loaded `clr.dll`, the .NET Framework 4 runtime.
+async fn has_clr(process_id: u32) -> bool {
+    let output = util::command::new_command("tasklist")
+        .args(["/M", "clr.dll", "/FI"])
+        .arg(format!("PID eq {process_id}"))
+        .args(["/FO", "CSV", "/NH"])
+        .output()
+        .await;
+    // Only matching processes are listed (`"iisexpress.exe","1234","clr.dll"`); otherwise
+    // tasklist prints a localized message.
+    output.is_ok_and(|output| {
+        String::from_utf8_lossy(&output.stdout).contains(&format!("\"{process_id}\""))
+    })
 }
 
 fn build_project(
@@ -666,6 +845,103 @@ impl DotnetProjects {
             })
         })
     }
+
+    fn debug_plan(
+        &mut self,
+        configuration: RunConfiguration,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<DebugPlan>> {
+        let Some(project) = self.project(&configuration.project_path).cloned() else {
+            return Task::ready(Err(anyhow!(
+                "{} is no longer part of this workspace",
+                configuration.project_path.display()
+            )));
+        };
+        let solution = self.solution_for(&project.path).cloned();
+        let label = format!("Debug {}", configuration.label());
+
+        match &configuration.kind {
+            RunKind::DotnetRun { .. } => Task::ready(
+                debug::dotnet_run_scenario(&configuration, &project).map(DebugPlan::Launch),
+            ),
+            RunKind::Executable => {
+                let msbuild = self.msbuild_path(cx);
+                cx.spawn(async move |_, _| {
+                    let build = msbuild_command(
+                        &msbuild.await?,
+                        &project.path,
+                        solution.as_ref().map(Solution::directory),
+                        BuildVerb::Build,
+                    );
+                    Ok(DebugPlan::Launch(debug::executable_scenario(
+                        &configuration,
+                        &project,
+                        build,
+                    )))
+                })
+            }
+            RunKind::IisExpress => {
+                if let Some(reason) = iis_express_32_bit_reason(&project) {
+                    return Task::ready(Err(anyhow!(
+                        "{reason}. dotnet-debugger only debugs 64-bit processes: to debug the \
+                         site, set Use64BitIISExpress to true and build it for AnyCPU or x64. \
+                         `dotnet: run` still runs it."
+                    )));
+                }
+                if project
+                    .target_frameworks
+                    .iter()
+                    .any(|version| version.starts_with("v2") || version.starts_with("v3"))
+                {
+                    return Task::ready(Err(anyhow!(
+                        "{} targets .NET Framework 3.5 or earlier (CLR 2), which dotnet-debugger \
+                         can't debug",
+                        project.name
+                    )));
+                }
+                let fs = self.project.read(cx).fs().clone();
+                let msbuild = self.msbuild_path(cx);
+                cx.spawn(async move |_, _| {
+                    let iis_express = find_64_bit_iis_express(fs.as_ref()).await.context(
+                        "Debugging needs the 64-bit IIS Express \
+                         (C:\\Program Files\\IIS Express\\iisexpress.exe), because \
+                         dotnet-debugger only debugs 64-bit processes. Install IIS Express from \
+                         https://www.microsoft.com/download/details.aspx?id=48264",
+                    )?;
+                    let site =
+                        find_iis_express_site(fs.as_ref(), solution.as_ref(), &project).await;
+                    let serve = iis_express_command(&iis_express, &project, site.as_ref());
+                    let site_argument = serve
+                        .args
+                        .iter()
+                        .find(|argument| {
+                            argument.starts_with("/site:") || argument.starts_with("/path:")
+                        })
+                        .cloned()
+                        .context("the IIS Express command names no site")?;
+                    let build = msbuild_command(
+                        &msbuild.await?,
+                        &project.path,
+                        solution.as_ref().map(Solution::directory),
+                        BuildVerb::Build,
+                    );
+                    Ok(DebugPlan::IisExpress(IisExpressDebugPlan {
+                        run: CommandPlan {
+                            // The label of `dotnet: run`, so that either one replaces the other's
+                            // IIS Express instead of failing to get the port.
+                            label: format!("Run {}", configuration.label()),
+                            source_path: project.path.clone(),
+                            steps: vec![build, serve],
+                            cwd: project.directory().to_path_buf(),
+                        },
+                        label,
+                        iis_express,
+                        site_argument,
+                    }))
+                })
+            }
+        }
+    }
 }
 
 fn affects_project_model(path: &RelPath) -> bool {
@@ -824,6 +1100,16 @@ async fn find_iis_express(fs: &dyn Fs) -> Option<PathBuf> {
     None
 }
 
+/// The 64-bit IIS Express, which only exists on 64-bit Windows, in `C:\Program Files`.
+async fn find_64_bit_iis_express(fs: &dyn Fs) -> Option<PathBuf> {
+    // `ProgramW6432` names the 64-bit Program Files whatever the bitness of Zed itself.
+    let program_files = std::env::var_os("ProgramW6432")?;
+    let path = PathBuf::from(program_files)
+        .join("IIS Express")
+        .join("iisexpress.exe");
+    fs.is_file(&path).await.then_some(path)
+}
+
 /// Looks for the IIS Express site Visual Studio (`.vs`) or Rider (`.idea`) configured for
 /// `project`, so that it runs with the same bindings, including HTTPS.
 async fn find_iis_express_site(
@@ -905,6 +1191,41 @@ fn schedule_plan(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    let (source_kind, template) = plan_task(plan);
+    workspace.schedule_task(
+        source_kind,
+        &template,
+        &TaskContext::default(),
+        false,
+        window,
+        cx,
+    );
+}
+
+/// Like `schedule_plan`, and calls `on_complete` when the task ends.
+fn schedule_plan_with_completion(
+    plan: CommandPlan,
+    on_complete: impl FnOnce(ScheduledTaskResult, &mut AsyncWindowContext) + 'static,
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Result<()> {
+    let (source_kind, template) = plan_task(plan);
+    let task = template
+        .resolve_task(&source_kind.to_id_base(), &TaskContext::default())
+        .with_context(|| format!("could not resolve the task {}", template.label))?;
+    workspace.schedule_resolved_task_with_completion(
+        source_kind,
+        task,
+        false,
+        on_complete,
+        window,
+        cx,
+    );
+    Ok(())
+}
+
+fn plan_task(plan: CommandPlan) -> (TaskSourceKind, TaskTemplate) {
     // Tasks are passed to the system shell verbatim, so arguments must be quoted for it.
     let shell_kind = ShellKind::new(get_system_shell(), cfg!(windows));
     let template = TaskTemplate {
@@ -923,14 +1244,7 @@ fn schedule_plan(
         id_base: Cow::Borrowed("dotnet"),
         abs_path: plan.source_path,
     };
-    workspace.schedule_task(
-        source_kind,
-        &template,
-        &TaskContext::default(),
-        false,
-        window,
-        cx,
-    );
+    (source_kind, template)
 }
 
 fn shell_command_line(steps: &[CommandLine], shell_kind: ShellKind) -> String {
@@ -1019,21 +1333,17 @@ impl Render for RunConfigurationIndicator {
                         }))
                         .tooltip(Tooltip::for_action_title("Run", &Run)),
                 )
-                .when(configuration.can_debug(), |this| {
-                    this.child(
-                        IconButton::new("dotnet-debug", IconName::Debug)
-                            .icon_size(IconSize::Small)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                let projects = this.projects.clone();
-                                this.workspace
-                                    .update(cx, |workspace, cx| {
-                                        debug(&projects, workspace, window, cx)
-                                    })
-                                    .log_err();
-                            }))
-                            .tooltip(Tooltip::for_action_title("Debug", &Debug)),
-                    )
-                }),
+                .child(
+                    IconButton::new("dotnet-debug", IconName::Debug)
+                        .icon_size(IconSize::Small)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            let projects = this.projects.clone();
+                            this.workspace
+                                .update(cx, |workspace, cx| debug(&projects, workspace, window, cx))
+                                .log_err();
+                        }))
+                        .tooltip(Tooltip::for_action_title("Debug", &Debug)),
+                ),
         )
     }
 }
