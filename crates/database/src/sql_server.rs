@@ -47,7 +47,6 @@ enum Stopped {
 
 pub struct SqlServerClient {
     client: TdsClient,
-    database: Option<String>,
     /// Whether the stream drops stray Attention acknowledgements (see [`AttentionAckFilter`]),
     /// which is what lets a cancelled session be reused.
     filters_attention_acks: bool,
@@ -191,26 +190,14 @@ impl SqlServerClient {
         }
         Ok(Self {
             client,
-            database: database.map(ToOwned::to_owned),
             filters_attention_acks: filter.is_some(),
         })
     }
 
+    /// Runs `sql` as a SQL batch. `sp_executesql` (tiberius's `Client::execute`) would scope
+    /// temp tables, `USE`, `SET` options and transactions to the call, so even statements that
+    /// return no rows don't go through it.
     pub async fn execute(&mut self, sql: &str, execution: &mut Execution) -> Result<ExecutionEnd> {
-        if !sql::may_return_rows(sql) {
-            let interrupt = match execution.guard(self.client.execute(sql, &[])).await {
-                Ok(result) => {
-                    for count in result?.rows_affected() {
-                        execution.emit(ExecutionEvent::RowsAffected(*count));
-                    }
-                    return Ok(ExecutionEnd::Completed);
-                }
-                Err(interrupt) => interrupt,
-            };
-            self.cancel_request().await?;
-            return Ok(interrupt.into());
-        }
-
         let stopped = match execution.guard(self.client.simple_query(sql)).await {
             Err(interrupt) => Stopped::Interrupted(interrupt),
             Ok(stream) => {
@@ -247,11 +234,38 @@ impl SqlServerClient {
             }
         };
         match stopped {
-            Stopped::Finished => Ok(ExecutionEnd::Completed),
+            Stopped::Finished => {
+                if reports_row_count(sql)
+                    && let Some(count) = self.last_row_count().await
+                {
+                    execution.emit(ExecutionEvent::RowsAffected(count));
+                }
+                Ok(ExecutionEnd::Completed)
+            }
             Stopped::Drained(interrupt) => Ok(interrupt.into()),
             Stopped::Interrupted(interrupt) => {
                 self.cancel_request().await?;
                 Ok(interrupt.into())
+            }
+        }
+    }
+
+    /// The number of rows the previous batch's last statement affected. Tiberius drops the
+    /// per-statement counts in a batch's `DONE` tokens (it only reports them for
+    /// `sp_executesql`), so this asks the server in a batch of its own. The statement already
+    /// ran, so a failure here is logged rather than reported as the statement's.
+    async fn last_row_count(&mut self) -> Option<u64> {
+        let row = match self.client.simple_query("SELECT ROWCOUNT_BIG()").await {
+            Ok(stream) => stream.into_row().await,
+            Err(error) => Err(error),
+        };
+        match row {
+            Ok(row) => row
+                .and_then(|row| row.get::<i64, _>(0))
+                .and_then(|count| u64::try_from(count).ok()),
+            Err(error) => {
+                log::error!("couldn't read the affected-row count: {error}");
+                None
             }
         }
     }
@@ -531,7 +545,13 @@ impl SqlServerClient {
                 )));
             }
         };
-        if let (Some(source), Some(current)) = (&source_database, &self.database)
+        // The session's database, which a `USE` in the console may have changed.
+        let current_database = self
+            .query_rows("SELECT DB_NAME()", &[])
+            .await?
+            .first()
+            .and_then(|row| string(row, 0));
+        if let (Some(source), Some(current)) = (&source_database, &current_database)
             && !source.eq_ignore_ascii_case(current)
         {
             return Ok(Err(format!(
@@ -882,6 +902,20 @@ async fn local_db_pipe(instance: &str) -> Result<String> {
             Some(line[start + 3..].trim().to_string())
         })
         .with_context(|| format!("LocalDB instance {instance} reported no pipe name"))
+}
+
+/// Whether `ROWCOUNT_BIG()` after the batch gives its count: the batch's last statement is its
+/// only data change. With several, the count would read as the whole batch's.
+fn reports_row_count(sql: &str) -> bool {
+    let statements = sql::split_statements(sql, sql::Dialect::SqlServer);
+    let is_data_change =
+        |range: &std::ops::Range<usize>| sql.get(range.clone()).is_some_and(sql::is_data_change);
+    statements.last().is_some_and(is_data_change)
+        && statements
+            .iter()
+            .filter(|range| is_data_change(range))
+            .count()
+            == 1
 }
 
 fn string(row: &Row, index: usize) -> Option<String> {

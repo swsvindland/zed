@@ -30,6 +30,17 @@ It has no UI; drivers are async and run on the Tokio runtime from `gpui_tokio`.
   `fetch_limit` (default `DEFAULT_FETCH_LIMIT`, 500; `0` reads everything) with the server's
   result left open. The `ExecutionHandle` asks for the next page, for everything, or cancels;
   dropping it cancels too. While a result is open its session is busy.
+  - On SQL Server every run is sent as a SQL batch, so temp tables, `USE`, `SET` options and
+    transactions stay with the session between runs. (Tiberius's `Client::execute` goes
+    through `sp_executesql`, which scopes all of those to the call; `BEGIN TRANSACTION` alone
+    fails there with error 266.) Tiberius 0.13 drops the `DONE` tokens that carry a batch's
+    per-statement row counts, so the count is read back afterwards with
+    `SELECT ROWCOUNT_BIG()` in a batch of its own. That only knows the last statement's count,
+    so a count is reported when a run's last statement is its only data change (`INSERT`,
+    `UPDATE`, `DELETE` or `MERGE`, also after `WITH`), including under `SET NOCOUNT ON`.
+    Other runs report completion without a count, and `@@ROWCOUNT` in the next run reads the
+    probe's 1. A tiberius change that kept the `DONE` counts on `QueryStream` would give every
+    statement its own count.
   - `query_timeout_seconds` cancels a statement whose server work runs longer. Time spent
     paused at the fetch limit doesn't count.
   - Cancelling on SQL Server reads a small remainder to the end if it's already on the wire,
@@ -70,7 +81,8 @@ It has no UI; drivers are async and run on the Tokio runtime from `gpui_tokio`.
 against simulated result streams, and completion (alias resolution, join conditions, quoting).
 To also run the end-to-end tests against a real SQL Server, point them at a server reachable
 with integrated authentication. They create a `ZedDatabaseTest` database and check cancelling
-on the server (including the session surviving it), paging and timeouts.
+on the server (including the session surviving it), paging and timeouts, and that temp tables,
+`USE`, `SET` options and open transactions carry over between runs with row counts reported.
 
 ```sh
 ZED_DATABASE_TEST_SQL_SERVER='(localdb)\MSSQLLocalDB' cargo test -p database --test local_db

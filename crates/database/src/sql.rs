@@ -142,8 +142,7 @@ pub fn statement_at(text: &str, offset: usize, dialect: Dialect) -> Option<Range
         .cloned()
 }
 
-/// Whether a statement may return rows. SQL Server's batch API only reports affected-row counts
-/// for statements executed without reading results, so the driver uses this to pick a mode.
+/// Whether a statement may return rows. Only such statements are worth describing for editing.
 pub fn may_return_rows(text: &str) -> bool {
     const ROW_KEYWORDS: &[&str] = &[
         "SELECT",
@@ -192,6 +191,35 @@ pub fn may_return_rows(text: &str) -> bool {
         first_word = false;
         if ROW_KEYWORDS.iter().any(is_keyword) {
             found = true;
+        }
+    });
+    found
+}
+
+/// Whether a statement changes rows: `INSERT`, `UPDATE`, `DELETE` or `MERGE`, also after a
+/// `WITH` clause. `UPDATE STATISTICS` isn't one.
+pub fn is_data_change(statement: &str) -> bool {
+    const DATA_CHANGES: &[&str] = &["INSERT", "UPDATE", "DELETE", "MERGE"];
+    let is_data_change_keyword = |word: &str| {
+        DATA_CHANGES
+            .iter()
+            .any(|keyword| word.eq_ignore_ascii_case(keyword))
+    };
+    let mut words = 0;
+    let mut first_is_data_change = false;
+    let mut after_with = false;
+    let mut found = false;
+    for_each_word(statement, |word| {
+        words += 1;
+        match words {
+            1 => {
+                first_is_data_change = is_data_change_keyword(word);
+                after_with = word.eq_ignore_ascii_case("WITH");
+                found = first_is_data_change;
+            }
+            2 if first_is_data_change && word.eq_ignore_ascii_case("STATISTICS") => found = false,
+            _ if after_with && is_data_change_keyword(word) => found = true,
+            _ => {}
         }
     });
     found
@@ -623,6 +651,30 @@ mod tests {
         assert!(!may_return_rows("UPDATE t SET a = 'select' -- select"));
         assert!(!may_return_rows("INSERT INTO t (a) VALUES (1)"));
         assert!(may_return_rows("sp_who2"));
+    }
+
+    #[test]
+    fn detects_data_changes() {
+        for statement in [
+            "UPDATE t SET a = 1",
+            "insert into t values (1)",
+            "-- note\nDELETE FROM t WHERE a IN (SELECT a FROM u)",
+            "MERGE t USING s ON t.a = s.a WHEN MATCHED THEN DELETE;",
+            "WITH old AS (SELECT * FROM t WHERE a < 0) DELETE FROM old",
+        ] {
+            assert!(is_data_change(statement), "{statement}");
+        }
+        for statement in [
+            "SELECT * FROM t",
+            "UPDATE STATISTICS t",
+            "WITH x AS (SELECT [update] FROM t) SELECT * FROM x",
+            "CREATE TABLE #t (a int)",
+            "BEGIN TRANSACTION",
+            "IF 1 = 1 UPDATE t SET a = 1",
+            "SELECT 'DELETE'",
+        ] {
+            assert!(!is_data_change(statement), "{statement}");
+        }
     }
 
     #[test]

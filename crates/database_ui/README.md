@@ -31,7 +31,10 @@ so it persists and keeps its connection. Any other `.sql` file can be bound with
   statement under the cursor. `ctrl-shift-enter`, `database: run script`, runs the whole file.
 - Results open in a pane below the editor: a grid per result set (sortable and filterable,
   from `tabular_data_preview`), plus a **Messages** tab with row counts, timing and errors.
-  Each console has its own session, so transactions and temp tables carry over between runs.
+  Each console has its own session, so transactions, temp tables, `USE` and `SET` options carry
+  over between runs. After a `USE`, completion still offers the console's own database.
+  SQL Server reports a row count only when a run's last statement is its only `INSERT`,
+  `UPDATE`, `DELETE` or `MERGE`; see the `database` README.
 - Rows stream in a page at a time. Each result set stops at the connection's fetch limit
   (500 rows unless set in the connection form; 0 fetches everything) and its tab shows
   **500+**. **Next 500** (`database: fetch next page`) and **All** (`database: fetch all rows`)

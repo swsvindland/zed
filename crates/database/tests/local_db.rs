@@ -60,8 +60,8 @@ async fn sql_server_cancel_paging_and_timeout() -> anyhow::Result<()> {
         return Ok(());
     };
     let mut client = Client::connect(&profile, None, None).await?;
-    // A batch rather than `sp_executesql`, so the temp table outlives the statement.
-    client.run("SELECT 1 AS Id INTO #session_marker").await?;
+    // Lives as long as the session does.
+    client.run("CREATE TABLE #session_marker (Id int)").await?;
 
     // NULL and the empty string stay distinct.
     let output = client.run("SELECT NULL AS a, '' AS b").await?;
@@ -70,7 +70,7 @@ async fn sql_server_cancel_paging_and_timeout() -> anyhow::Result<()> {
     };
     assert_eq!(result.rows, vec![vec![None, Some(String::new())]]);
 
-    // Stop a statement the server is still working on, on both the row and the count paths.
+    // Stop a statement the server is still working on, with and without a result set to come.
     for sql in [
         "WAITFOR DELAY '00:00:30'; SELECT 1 AS One",
         "DECLARE @wait int = 1; WAITFOR DELAY '00:00:30'",
@@ -303,6 +303,147 @@ async fn sql_server_round_trip() -> anyhow::Result<()> {
     );
     // The session must still be usable after the rollback.
     client.run("SELECT 1").await?;
+
+    Ok(())
+}
+
+/// The first value of a run that returns one result set.
+async fn scalar(client: &mut Client, sql: &str) -> anyhow::Result<Option<String>> {
+    let output = client.run(sql).await?;
+    let [StatementOutcome::Rows(result)] = &output.outcomes[..] else {
+        anyhow::bail!(
+            "expected one result set from `{sql}`: {:?}",
+            output.outcomes
+        );
+    };
+    Ok(result
+        .rows
+        .first()
+        .and_then(|row| row.first())
+        .cloned()
+        .flatten())
+}
+
+/// Each run is a batch on the console's session, so what one run sets up is still there in the
+/// next, and data changes still report how many rows they affected.
+#[tokio::test(flavor = "multi_thread")]
+async fn sql_server_session_state_carries_over_between_runs() -> anyhow::Result<()> {
+    let Some(profile) = profile() else {
+        eprintln!("ZED_DATABASE_TEST_SQL_SERVER not set; skipping");
+        return Ok(());
+    };
+    let completed = || vec![StatementOutcome::Completed];
+    let affected = |count| vec![StatementOutcome::RowsAffected(count)];
+    let value = |text: &str| Some(text.to_string());
+
+    let mut client = Client::connect(&profile, Some("master"), None).await?;
+
+    // `USE` and `SET` options stay in effect.
+    assert_eq!(client.run("USE tempdb").await?.outcomes, completed());
+    assert_eq!(
+        scalar(&mut client, "SELECT DB_NAME()").await?,
+        value("tempdb")
+    );
+    assert_eq!(
+        client.run("SET LOCK_TIMEOUT 1234").await?.outcomes,
+        completed()
+    );
+    assert_eq!(
+        scalar(&mut client, "SELECT @@LOCK_TIMEOUT").await?,
+        value("1234")
+    );
+
+    // A temp table created on its own outlives its run.
+    assert_eq!(
+        client
+            .run("CREATE TABLE #items (Id int PRIMARY KEY, Name nvarchar(20) NOT NULL)")
+            .await?
+            .outcomes,
+        completed()
+    );
+    assert_eq!(
+        client
+            .run("INSERT INTO #items VALUES (1, N'a'), (2, N'b'), (3, N'c')")
+            .await?
+            .outcomes,
+        affected(3)
+    );
+
+    // A transaction begun in one run stays open until a later one rolls it back or commits.
+    assert_eq!(client.run("BEGIN TRANSACTION").await?.outcomes, completed());
+    assert_eq!(scalar(&mut client, "SELECT @@TRANCOUNT").await?, value("1"));
+    assert_eq!(
+        client
+            .run("UPDATE #items SET Name = N'x' WHERE Id <= 2")
+            .await?
+            .outcomes,
+        affected(2)
+    );
+    assert_eq!(client.run("ROLLBACK").await?.outcomes, completed());
+    assert_eq!(
+        scalar(&mut client, "SELECT Name FROM #items WHERE Id = 1").await?,
+        value("a")
+    );
+    assert_eq!(client.run("BEGIN TRAN").await?.outcomes, completed());
+    assert_eq!(
+        client
+            .run("DELETE FROM #items WHERE Id = 3")
+            .await?
+            .outcomes,
+        affected(1)
+    );
+    assert_eq!(client.run("COMMIT").await?.outcomes, completed());
+    assert_eq!(
+        scalar(
+            &mut client,
+            "SELECT CONCAT(@@TRANCOUNT, ' open, ', COUNT(*), ' rows') FROM #items"
+        )
+        .await?,
+        value("0 open, 2 rows")
+    );
+
+    // Counts survive a subquery, `SET NOCOUNT ON` and earlier statements that change no rows.
+    assert_eq!(
+        client
+            .run("UPDATE #items SET Name = N'y' WHERE Id IN (SELECT Id FROM #items)")
+            .await?
+            .outcomes,
+        affected(2)
+    );
+    assert_eq!(client.run("SET NOCOUNT ON").await?.outcomes, completed());
+    assert_eq!(
+        client
+            .run("DECLARE @id int = 99;\nDELETE FROM #items WHERE Id = @id")
+            .await?
+            .outcomes,
+        affected(0)
+    );
+    // Only the last statement's count can be read back, so a run with several changes has none.
+    assert_eq!(
+        client
+            .run("INSERT INTO #items VALUES (4, N'd');\nINSERT INTO #items VALUES (5, N'e')")
+            .await?
+            .outcomes,
+        completed()
+    );
+    assert!(
+        client
+            .run("INSERT INTO #items VALUES (1, N'again')")
+            .await
+            .is_err()
+    );
+
+    // Editing goes by the database the session is in now, not the one it connected to.
+    client
+        .run(
+            "DROP TABLE IF EXISTS dbo.SessionNotes;\n\
+             CREATE TABLE dbo.SessionNotes (Id int PRIMARY KEY, Body nvarchar(20) NULL)",
+        )
+        .await?;
+    let target = client
+        .editability("SELECT Id, Body FROM dbo.SessionNotes")
+        .await?;
+    assert!(target.is_ok(), "{target:?}");
 
     Ok(())
 }
