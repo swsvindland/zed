@@ -1,10 +1,4 @@
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
-};
+use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use futures::{AsyncRead, AsyncWrite, StreamExt as _};
@@ -48,9 +42,6 @@ enum Stopped {
 pub struct SqlServerClient {
     client: TdsClient,
     database: Option<String>,
-    /// Whether the stream drops stray Attention acknowledgements (see [`AttentionAckFilter`]),
-    /// which is what lets a cancelled session be reused.
-    filters_attention_acks: bool,
 }
 
 enum Endpoint {
@@ -172,27 +163,12 @@ impl SqlServerClient {
             }
         };
 
-        // Below TLS the filter would see ciphertext, so encrypted sessions go without it.
-        let is_encrypted = matches!(
-            parse_endpoint(&profile.host, profile.port),
-            Endpoint::Tcp { .. }
-        ) && profile.encrypt;
-        let filter = (!is_encrypted).then(|| Arc::new(AtomicBool::new(false)));
-        let stream: Box<dyn TdsStream> = match &filter {
-            Some(enabled) => Box::new(AttentionAckFilter::new(stream, enabled.clone())),
-            None => stream,
-        };
         let client = tiberius::Client::connect(config, stream)
             .await
             .with_context(|| format!("logging in to {}", profile.host))?;
-        // Login is done and fully read, so the stream is at a packet boundary from here on.
-        if let Some(enabled) = &filter {
-            enabled.store(true, Ordering::Release);
-        }
         Ok(Self {
             client,
             database: database.map(ToOwned::to_owned),
-            filters_attention_acks: filter.is_some(),
         })
     }
 
@@ -234,9 +210,8 @@ impl SqlServerClient {
                 match execution.read(&mut items).await? {
                     ReadEnd::Exhausted => Stopped::Finished,
                     // Dropping the stream mid-token would leave the Attention's acknowledgement
-                    // unreadable, so stop between tokens first. An Attention sent after the
-                    // whole response arrived is acknowledged in a message of its own, which
-                    // tiberius doesn't wait for, so a drained result must not get one.
+                    // unreadable, so stop between tokens first. A result that drains to its
+                    // end needs no Attention, which saves a round trip.
                     ReadEnd::Interrupted(interrupt) => {
                         match settle(&mut items, DRAIN_BEFORE_CANCEL, is_connection_error).await? {
                             Settled::Ended => Stopped::Drained(interrupt),
@@ -257,19 +232,13 @@ impl SqlServerClient {
     }
 
     /// Sends an Attention for the request in flight and waits for the server to acknowledge
-    /// it. If the session can't be brought back in sync it fails with [`SessionReset`], which
+    /// it. SQL Server sends the acknowledgement in a message of its own after the cancelled
+    /// response; the patched tiberius (`tooling/patches/tiberius`) reads on until it arrives.
+    /// If the session can't be brought back in sync it fails with [`SessionReset`], which
     /// makes the pool reconnect.
     async fn cancel_request(&mut self) -> Result<()> {
         match tokio::time::timeout(CANCEL_TIMEOUT, self.client.cancel_query()).await {
             Ok(Ok(())) => Ok(()),
-            // SQL Server ends the cancelled request's response, then acknowledges the Attention
-            // in a message of its own, and tiberius gives up at the end of the first message.
-            // The filter drops the acknowledgement when it arrives.
-            Ok(Err(tiberius::error::Error::Protocol(message)))
-                if self.filters_attention_acks && message.contains("Never got a DONE token") =>
-            {
-                Ok(())
-            }
             Ok(Err(error)) => Err(SessionReset(format!("{error}")).into()),
             Err(_) => Err(SessionReset(format!(
                 "SQL Server didn't acknowledge the cancel within {} s",
@@ -675,163 +644,6 @@ impl<T> LogRollbackError for tiberius::Result<T> {
     }
 }
 
-const PACKET_HEADER_LENGTH: usize = 8;
-/// A packet header plus one `DONE` token (type, status, current command, row count).
-const ATTENTION_ACK_LENGTH: usize = PACKET_HEADER_LENGTH + 13;
-const TABULAR_RESULT_PACKET: u8 = 0x04;
-const END_OF_MESSAGE: u8 = 0x01;
-const DONE_TOKEN: u8 = 0xFD;
-const DONE_ATTENTION: u16 = 0x20;
-
-/// Whether `packet` is a whole message holding only the `DONE` that acknowledges an Attention.
-/// Nothing else carries the attention bit, so dropping these can't hide a real reply.
-fn is_attention_ack(packet: &[u8]) -> bool {
-    let [
-        kind,
-        status,
-        _,
-        _,
-        _,
-        _,
-        _,
-        _,
-        token,
-        status_low,
-        status_high,
-        ..,
-    ] = packet
-    else {
-        return false;
-    };
-    packet.len() == ATTENTION_ACK_LENGTH
-        && *kind == TABULAR_RESULT_PACKET
-        && status & END_OF_MESSAGE != 0
-        && *token == DONE_TOKEN
-        && u16::from_le_bytes([*status_low, *status_high]) & DONE_ATTENTION != 0
-}
-
-/// Drops the separate Attention acknowledgements that tiberius doesn't read (see
-/// `SqlServerClient::cancel_request`); otherwise one would be taken as the reply to the next
-/// request. It reads whole TDS packets, so it only works on an unencrypted stream, and it
-/// passes bytes through untouched until `enabled` is set after login.
-struct AttentionAckFilter<S> {
-    inner: S,
-    enabled: Arc<AtomicBool>,
-    /// Bytes read from `inner` that don't yet form a whole packet.
-    incoming: Vec<u8>,
-    /// Whole packets waiting to be read, from `ready_start`.
-    ready: Vec<u8>,
-    ready_start: usize,
-    at_end: bool,
-}
-
-impl<S> AttentionAckFilter<S> {
-    fn new(inner: S, enabled: Arc<AtomicBool>) -> Self {
-        Self {
-            inner,
-            enabled,
-            incoming: Vec::new(),
-            ready: Vec::new(),
-            ready_start: 0,
-            at_end: false,
-        }
-    }
-
-    fn take_packets(&mut self) {
-        loop {
-            let [_, _, length_high, length_low, ..] = self.incoming[..] else {
-                return;
-            };
-            let length = usize::from(u16::from_be_bytes([length_high, length_low]));
-            if length < PACKET_HEADER_LENGTH {
-                // Not a TDS packet header: stop interpreting and pass everything through.
-                self.enabled.store(false, Ordering::Release);
-                self.ready.append(&mut self.incoming);
-                return;
-            }
-            if self.incoming.len() < length {
-                return;
-            }
-            let packet = self.incoming.drain(..length).collect::<Vec<_>>();
-            if is_attention_ack(&packet) {
-                log::debug!("dropped a separate Attention acknowledgement");
-            } else {
-                self.ready.extend_from_slice(&packet);
-            }
-        }
-    }
-}
-
-impl<S: AsyncRead + Unpin> AsyncRead for AttentionAckFilter<S> {
-    fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut [u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        let this = self.get_mut();
-        loop {
-            if let Some(ready) = this.ready.get(this.ready_start..)
-                && !ready.is_empty()
-            {
-                let count = ready.len().min(buf.len());
-                if let (Some(target), Some(source)) = (buf.get_mut(..count), ready.get(..count)) {
-                    target.copy_from_slice(source);
-                }
-                this.ready_start += count;
-                if this.ready_start >= this.ready.len() {
-                    this.ready.clear();
-                    this.ready_start = 0;
-                }
-                return std::task::Poll::Ready(Ok(count));
-            }
-            if !this.enabled.load(Ordering::Acquire) && this.incoming.is_empty() {
-                return std::pin::Pin::new(&mut this.inner).poll_read(cx, buf);
-            }
-            if this.at_end {
-                if this.incoming.is_empty() {
-                    return std::task::Poll::Ready(Ok(0));
-                }
-                this.ready.append(&mut this.incoming);
-                continue;
-            }
-            let mut chunk = [0; 8192];
-            let count =
-                std::task::ready!(std::pin::Pin::new(&mut this.inner).poll_read(cx, &mut chunk))?;
-            match chunk.get(..count) {
-                Some(read) if !read.is_empty() => {
-                    this.incoming.extend_from_slice(read);
-                    this.take_packets();
-                }
-                _ => this.at_end = true,
-            }
-        }
-    }
-}
-
-impl<S: AsyncWrite + Unpin> AsyncWrite for AttentionAckFilter<S> {
-    fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        std::pin::Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
-    }
-
-    fn poll_close(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.get_mut().inner).poll_close(cx)
-    }
-}
-
 #[cfg(windows)]
 async fn open_named_pipe(path: &str) -> Result<Box<dyn TdsStream>> {
     use tokio::net::windows::named_pipe::ClientOptions;
@@ -969,51 +781,6 @@ fn type_name(column_type: ColumnType) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn drops_only_separate_attention_acknowledgements() {
-        use futures::AsyncReadExt as _;
-
-        // As captured from LocalDB: a cancelled batch's response, then the acknowledgement.
-        let response = [
-            0x04, 0x01, 0x00, 0x15, 0x00, 0x55, 0x01, 0x00, 0xFD, 0x02, 0x00, 0xFD, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        ];
-        let mut acknowledgement = response;
-        acknowledgement[9] = 0x20;
-        let mut reply = response;
-        reply[9] = 0x10;
-        reply[13] = 0x07;
-        let wire = [&response[..], &acknowledgement, &reply].concat();
-
-        // A reader that hands the bytes over a few at a time, splitting packets.
-        struct Trickle(Vec<u8>, usize);
-        impl AsyncRead for Trickle {
-            fn poll_read(
-                mut self: std::pin::Pin<&mut Self>,
-                _: &mut std::task::Context<'_>,
-                buf: &mut [u8],
-            ) -> std::task::Poll<std::io::Result<usize>> {
-                let start = self.1;
-                let end = (start + 5).min(self.0.len()).min(start + buf.len());
-                buf[..end - start].copy_from_slice(&self.0[start..end]);
-                self.1 = end;
-                std::task::Poll::Ready(Ok(end - start))
-            }
-        }
-
-        let mut filtered = Vec::new();
-        let mut filter =
-            AttentionAckFilter::new(Trickle(wire.clone(), 0), Arc::new(AtomicBool::new(true)));
-        futures::executor::block_on(filter.read_to_end(&mut filtered)).unwrap();
-        assert_eq!(filtered, [&response[..], &reply].concat());
-
-        let mut untouched = Vec::new();
-        let mut disabled =
-            AttentionAckFilter::new(Trickle(wire.clone(), 0), Arc::new(AtomicBool::new(false)));
-        futures::executor::block_on(disabled.read_to_end(&mut untouched)).unwrap();
-        assert_eq!(untouched, wire);
-    }
 
     #[test]
     fn parses_endpoints() {

@@ -42,14 +42,14 @@ async fn cancel_after(handle: ExecutionHandle, delay: Duration) {
     handle.cancel();
 }
 
-/// The session must survive a stop: the temp table created at the start is still there.
+/// The session must survive a stop: the temp table created at the start is still there, and
+/// the reply is this statement's own rather than something the cancel left unread.
 async fn assert_session_kept(client: &mut Client) -> anyhow::Result<()> {
     let output = client.run("SELECT COUNT(*) FROM #session_marker").await?;
-    assert!(
-        matches!(&output.outcomes[..], [StatementOutcome::Rows(_)]),
-        "{:?}",
-        output.outcomes
-    );
+    let [StatementOutcome::Rows(result)] = &output.outcomes[..] else {
+        panic!("expected rows: {:?}", output.outcomes);
+    };
+    assert_eq!(result.rows, vec![vec![Some("1".to_string())]]);
     Ok(())
 }
 

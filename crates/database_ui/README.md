@@ -40,8 +40,7 @@ so it persists and keeps its connection. Any other `.sql` file can be bound with
 - **Stop** (`ctrl-f2` / `cmd-f2`, `database: stop statement`, or the red button in the console
   toolbar and the results header) cancels the running statement, or closes an open result.
   Rows already read stay in the grid. A connection's query timeout cancels the same way.
-  On encrypted SQL Server connections a stop also closes the console's session; see the
-  `database` README.
+  The console's session survives a stop, so temp tables and open transactions are kept.
 - `NULL` shows as a muted `<null>`, distinct from an empty string, in the grid and its filters.
 - Zed has no SQL grammar of its own, so this crate registers one (`tree-sitter-sequel`) unless
   a SQL language is already registered.

@@ -33,12 +33,13 @@ It has no UI; drivers are async and run on the Tokio runtime from `gpui_tokio`.
   - `query_timeout_seconds` cancels a statement whose server work runs longer. Time spent
     paused at the fetch limit doesn't count.
   - Cancelling on SQL Server reads a small remainder to the end if it's already on the wire,
-    and otherwise sends a TDS Attention. SQL Server acknowledges an Attention in a message of
-    its own after the cancelled response, which tiberius 0.13 doesn't read, so on unencrypted
-    sessions (LocalDB, named pipes, `encrypt: false`) a filter under tiberius drops that
-    acknowledgement and the session stays usable. Below TLS the filter can't see packets, so a
-    cancelled statement on an encrypted connection closes the session instead
-    (`SessionReset`) and the pool reconnects.
+    and otherwise sends a TDS Attention and waits for the server to acknowledge it, keeping
+    the session (temp tables, open transactions) on encrypted and unencrypted connections
+    alike. SQL Server acknowledges an Attention in a message of its own after the cancelled
+    response, which tiberius 0.13 doesn't read, so the workspace uses a patched copy
+    (`tooling/patches/tiberius`, see its `PATCHES.md`). Only a cancel the server doesn't
+    acknowledge within 30 s, or a broken connection, closes the session (`SessionReset`) and
+    makes the pool reconnect.
   - Cancelling on PostgreSQL sends a `CancelToken` request over its own connection and reads
     the statement to its end, keeping the session.
   - Tiberius's own `command_timeout` is turned off: when it fires it leaves the session out of
