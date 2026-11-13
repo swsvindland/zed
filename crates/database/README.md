@@ -41,8 +41,18 @@ It has no UI; drivers are async and run on the Tokio runtime from `gpui_tokio`.
     Other runs report completion without a count, and `@@ROWCOUNT` in the next run reads the
     probe's 1. A tiberius change that kept the `DONE` counts on `QueryStream` would give every
     statement its own count.
-  - `query_timeout_seconds` cancels a statement whose server work runs longer. Time spent
-    paused at the fetch limit doesn't count.
+  - `GO` lines are client-side separators that SQL Server rejects, so a run is first split into
+    batches (`sql::split_batches`) and they're sent one after another on the same session, as
+    SSMS and sqlcmd do. `GO n` sends the batch before it `n` times. Each batch gets the row
+    count check above on its own. The first batch that fails ends the run, with the batch
+    named in the error (`running batch 3 of 4 (from line 5)`); what earlier batches returned
+    has already been sent as events. A batch starts at the line after its `GO`, so SQL Server's
+    line numbers count from there, as in SSMS. `editability` describes a script only when it is
+    a single batch that runs once. PostgreSQL has no `GO` and runs the text as it is.
+  - `query_timeout_seconds` cancels a statement whose server work runs longer. It covers a
+    whole run, all of a script's batches together. Time spent paused at the fetch limit
+    doesn't count. A stop or timeout that lands between two batches ends the run there, with
+    nothing to cancel on the server.
   - Cancelling on SQL Server reads a small remainder to the end if it's already on the wire,
     and otherwise sends a TDS Attention. SQL Server acknowledges an Attention in a message of
     its own after the cancelled response, which tiberius 0.13 doesn't read, so on unencrypted
@@ -71,7 +81,9 @@ It has no UI; drivers are async and run on the Tokio runtime from `gpui_tokio`.
   `completion::may_change_schema` spots DDL, so callers know to read the catalog again.
 - **`ConnectionPool`** keeps one session per connection, database and session name.
 - **`sql`** splits scripts into statements (`;`, blank lines, `GO`, aware of strings, comments,
-  brackets, `BEGIN … END` and dollar quotes), and generates parameterized
+  brackets, `BEGIN … END` and dollar quotes) and SQL Server scripts into batches
+  (`split_batches`: `GO` or `GO n` alone on a line, optionally with a trailing `--` comment,
+  outside strings, quoted identifiers and nested block comments), and generates parameterized
   `UPDATE` / `INSERT` / `DELETE` statements. Values are always bound parameters, never
   concatenated into SQL text.
 
@@ -81,8 +93,10 @@ It has no UI; drivers are async and run on the Tokio runtime from `gpui_tokio`.
 against simulated result streams, and completion (alias resolution, join conditions, quoting).
 To also run the end-to-end tests against a real SQL Server, point them at a server reachable
 with integrated authentication. They create a `ZedDatabaseTest` database and check cancelling
-on the server (including the session surviving it), paging and timeouts, and that temp tables,
-`USE`, `SET` options and open transactions carry over between runs with row counts reported.
+on the server (including the session surviving it), paging and timeouts, that temp tables,
+`USE`, `SET` options and open transactions carry over between runs with row counts reported,
+and that `GO` scripts run batch by batch: `CREATE PROCEDURE` after a `GO`, `GO n`, an error in
+a later batch, and a stop or timeout spanning batches.
 
 ```sh
 ZED_DATABASE_TEST_SQL_SERVER='(localdb)\MSSQLLocalDB' cargo test -p database --test local_db

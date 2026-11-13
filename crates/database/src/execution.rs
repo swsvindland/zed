@@ -220,6 +220,24 @@ impl Execution {
         }
     }
 
+    /// Whether the run was cancelled or timed out while nothing was in flight, such as between
+    /// two batches of a script. Requests for more rows don't apply there and are dropped.
+    pub(crate) fn interrupted(&mut self) -> Option<Interrupt> {
+        if let Some(requests) = self.requests.as_mut() {
+            loop {
+                match requests.try_recv() {
+                    Ok(Request::Fetch(_)) => {}
+                    Ok(Request::Cancel) => return Some(Interrupt::Cancelled),
+                    Err(error) if error.is_closed() => return Some(Interrupt::Cancelled),
+                    Err(_) => break,
+                }
+            }
+        }
+        self.deadline
+            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+            .then(|| Interrupt::TimedOut(self.timeout()))
+    }
+
     /// Awaits `future`, unless the run is cancelled or times out first. The future is dropped
     /// when interrupted.
     pub(crate) async fn guard<F: Future>(&mut self, future: F) -> Result<F::Output, Interrupt> {

@@ -307,6 +307,170 @@ async fn sql_server_round_trip() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The rows of every result set in `events`, as `(first column name, rows)`.
+fn result_sets(events: Vec<ExecutionEvent>) -> Vec<(String, Vec<Vec<Option<String>>>)> {
+    let mut sets = Vec::new();
+    for outcome in database::collect_outcomes(events) {
+        if let StatementOutcome::Rows(result) = outcome {
+            let name = result
+                .columns
+                .first()
+                .map(|column| column.name.clone())
+                .unwrap_or_default();
+            sets.push((name, result.rows));
+        }
+    }
+    sets
+}
+
+/// `GO` lines split a script into batches that run one after another on the same session.
+#[tokio::test(flavor = "multi_thread")]
+async fn sql_server_runs_scripts_batch_by_batch() -> anyhow::Result<()> {
+    let Some(profile) = profile() else {
+        eprintln!("ZED_DATABASE_TEST_SQL_SERVER not set; skipping");
+        return Ok(());
+    };
+    let rows = |values: &[&str]| {
+        StatementOutcome::Rows(database::ResultSet {
+            columns: Vec::new(),
+            rows: values
+                .iter()
+                .map(|value| vec![Some(value.to_string())])
+                .collect(),
+        })
+    };
+    let without_columns = |outcomes: Vec<StatementOutcome>| {
+        outcomes
+            .into_iter()
+            .map(|outcome| match outcome {
+                StatementOutcome::Rows(mut result) => {
+                    result.columns.clear();
+                    StatementOutcome::Rows(result)
+                }
+                other => other,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let mut client = Client::connect(&profile, Some("tempdb"), None).await?;
+    client.run("CREATE TABLE #session_marker (Id int)").await?;
+
+    // `CREATE PROCEDURE` has to come first in its batch, and each batch sees what the ones
+    // before it made. `GO 3` runs its batch three times, each with its own row count.
+    let script = "CREATE TABLE #batch_items (Id int PRIMARY KEY, Name nvarchar(20) NOT NULL);\n\
+                  INSERT INTO #batch_items VALUES (1, N'a'), (2, N'b')\n\
+                  GO\n\
+                  CREATE PROCEDURE #batch_items_named @name nvarchar(20) AS\n\
+                  SELECT Id FROM #batch_items WHERE Name = @name\n\
+                  go -- the procedure ends here\n\
+                  EXEC #batch_items_named @name = N'b'\n\
+                  GO\n\
+                  INSERT INTO #batch_items SELECT MAX(Id) + 1, N'c' FROM #batch_items\n\
+                  GO 3\n\
+                  SELECT COUNT(*) AS n FROM #batch_items\n\
+                  GO\n";
+    let output = client.run(script).await?;
+    assert_eq!(
+        without_columns(output.outcomes),
+        vec![
+            StatementOutcome::RowsAffected(2),
+            rows(&["2"]),
+            StatementOutcome::RowsAffected(1),
+            StatementOutcome::RowsAffected(1),
+            StatementOutcome::RowsAffected(1),
+            rows(&["5"]),
+        ]
+    );
+
+    // An error stops the script at its batch. Earlier batches keep their results and changes,
+    // and later ones don't run.
+    let script = "SELECT 1 AS One\n\
+                  GO\n\
+                  INSERT INTO #batch_items VALUES (10, N'kept')\n\
+                  GO\n\
+                  SELECT * FROM #no_such_table\n\
+                  GO\n\
+                  INSERT INTO #batch_items VALUES (11, N'never')\n";
+    let (_handle, mut run, events) = execution(ExecutionOptions::default());
+    let error = client
+        .execute(script, &mut run)
+        .await
+        .expect_err("the third batch fails");
+    drop(run);
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("running batch 3 of 4 (from line 5)"),
+        "{message}"
+    );
+    assert!(message.contains("#no_such_table"), "{message}");
+    let events = events.collect::<Vec<_>>().await;
+    assert!(
+        events.contains(&ExecutionEvent::RowsAffected(1)),
+        "{events:?}"
+    );
+    assert_eq!(
+        result_sets(events),
+        vec![("One".to_string(), vec![vec![Some("1".to_string())]])]
+    );
+    assert_eq!(
+        scalar(
+            &mut client,
+            "SELECT STRING_AGG(Name, ',') FROM #batch_items WHERE Id >= 10"
+        )
+        .await?,
+        Some("kept".to_string())
+    );
+
+    // Editing needs a single batch: a trailing `GO` is fine, a repeated result isn't.
+    let editable = client.editability("SELECT 1 AS One\nGO").await?;
+    assert_eq!(
+        editable,
+        Err("The result doesn't come from a table.".into())
+    );
+    let repeated = client.editability("SELECT 1 AS One\nGO 2").await?;
+    assert!(
+        repeated.is_err_and(|reason| reason.contains("single statement")),
+        "a repeated batch isn't editable"
+    );
+
+    // The timeout covers the whole script, not each batch: every batch here finishes well
+    // within it, but together they don't.
+    let timeout = Duration::from_secs(1);
+    let (_handle, mut run, _events) = execution(ExecutionOptions {
+        fetch_limit: None,
+        timeout: Some(timeout),
+    });
+    let started = Instant::now();
+    let end = client
+        .execute("WAITFOR DELAY '00:00:00.400'\nGO 10", &mut run)
+        .await?;
+    assert_eq!(end, ExecutionEnd::TimedOut(timeout));
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert_session_kept(&mut client).await?;
+
+    // Stopping during a later batch keeps the earlier results and skips the batches after it.
+    let (handle, mut run, events) = execution(ExecutionOptions::default());
+    let started = Instant::now();
+    let (end, ()) = futures::join!(
+        client.execute(
+            "SELECT 1 AS One\nGO\nWAITFOR DELAY '00:00:30'\nGO\nSELECT 2 AS Two",
+            &mut run
+        ),
+        cancel_after(handle, Duration::from_millis(500))
+    );
+    assert_eq!(end?, ExecutionEnd::Cancelled);
+    assert!(started.elapsed() < Duration::from_secs(10));
+    drop(run);
+    let names = result_sets(events.collect().await)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["One".to_string()]);
+    assert_session_kept(&mut client).await?;
+
+    Ok(())
+}
+
 /// The first value of a run that returns one result set.
 async fn scalar(client: &mut Client, sql: &str) -> anyhow::Result<Option<String>> {
     let output = client.run(sql).await?;
