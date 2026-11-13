@@ -1,15 +1,25 @@
+mod dap_config;
+mod dotnet_debugger;
 mod netcoredbg;
 mod nuget;
 mod roslyn;
 
 use zed_extension_api::{self as zed, Result, serde_json};
 
-use crate::{netcoredbg::Netcoredbg, roslyn::Roslyn};
+use crate::{dotnet_debugger::DotnetDebugger, netcoredbg::Netcoredbg, roslyn::Roslyn};
 
 #[derive(Default)]
 struct CsharpExtension {
     roslyn: Roslyn,
     netcoredbg: Netcoredbg,
+    dotnet_debugger: DotnetDebugger,
+}
+
+fn is_known_adapter(adapter_name: &str) -> Result<()> {
+    match adapter_name {
+        Netcoredbg::ADAPTER_NAME | DotnetDebugger::ADAPTER_NAME => Ok(()),
+        other => Err(format!("unknown debug adapter: {other}")),
+    }
 }
 
 impl zed::Extension for CsharpExtension {
@@ -46,11 +56,17 @@ impl zed::Extension for CsharpExtension {
         user_provided_debug_adapter_path: Option<String>,
         worktree: &zed::Worktree,
     ) -> Result<zed::DebugAdapterBinary, String> {
-        if adapter_name != Netcoredbg::ADAPTER_NAME {
-            return Err(format!("unknown debug adapter: {adapter_name}"));
+        match adapter_name.as_str() {
+            Netcoredbg::ADAPTER_NAME => {
+                self.netcoredbg
+                    .binary(config, user_provided_debug_adapter_path, worktree)
+            }
+            DotnetDebugger::ADAPTER_NAME => {
+                self.dotnet_debugger
+                    .binary(config, user_provided_debug_adapter_path, worktree)
+            }
+            other => Err(format!("unknown debug adapter: {other}")),
         }
-        self.netcoredbg
-            .binary(config, user_provided_debug_adapter_path, worktree)
     }
 
     fn dap_request_kind(
@@ -58,20 +74,16 @@ impl zed::Extension for CsharpExtension {
         adapter_name: String,
         config: serde_json::Value,
     ) -> Result<zed::StartDebuggingRequestArgumentsRequest, String> {
-        if adapter_name != Netcoredbg::ADAPTER_NAME {
-            return Err(format!("unknown debug adapter: {adapter_name}"));
-        }
-        Netcoredbg::request_kind(&config)
+        is_known_adapter(&adapter_name)?;
+        dap_config::request_kind(&config)
     }
 
     fn dap_config_to_scenario(
         &mut self,
         config: zed::DebugConfig,
     ) -> Result<zed::DebugScenario, String> {
-        if config.adapter != Netcoredbg::ADAPTER_NAME {
-            return Err(format!("unknown debug adapter: {}", config.adapter));
-        }
-        Netcoredbg::config_to_scenario(config)
+        is_known_adapter(&config.adapter)?;
+        dap_config::config_to_scenario(config)
     }
 }
 

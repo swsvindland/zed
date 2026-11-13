@@ -1,0 +1,103 @@
+{
+  "type": "object",
+  "required": ["request"],
+  "properties": {
+    "request": {
+      "type": "string",
+      "enum": ["launch", "attach"],
+      "description": "Whether to launch a new process or attach to a running one."
+    },
+    "program": {
+      "type": "string",
+      "description": "Path to the program to launch: a .NET Framework .exe, a .NET .dll, or an apphost executable."
+    },
+    "project": {
+      "type": "string",
+      "description": "Instead of program: a project file or directory whose output (MSBuild TargetPath) is launched. Legacy projects are resolved with MSBuild.exe."
+    },
+    "build": {
+      "type": "boolean",
+      "description": "Build the project before launching it.",
+      "default": false
+    },
+    "configuration": {
+      "type": "string",
+      "description": "Build configuration used with project.",
+      "default": "Debug"
+    },
+    "framework": {
+      "type": "string",
+      "description": "Target framework to debug when project targets several, such as net48."
+    },
+    "args": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Command line arguments passed to the program.",
+      "default": []
+    },
+    "cwd": {
+      "type": "string",
+      "description": "Working directory of the program.",
+      "default": "${ZED_WORKTREE_ROOT}"
+    },
+    "env": {
+      "type": "object",
+      "additionalProperties": { "type": ["string", "null"] },
+      "description": "Environment variables for the program; null removes a variable.",
+      "default": {}
+    },
+    "console": {
+      "type": "string",
+      "enum": ["internalConsole", "integratedTerminal", "externalTerminal"],
+      "description": "Where the program's console goes. Only the terminals give it standard input.",
+      "default": "internalConsole"
+    },
+    "launchSettingsProfile": {
+      "type": "string",
+      "description": "launchSettings.json profile to apply with project; an empty string applies none."
+    },
+    "stopAtEntry": {
+      "type": "boolean",
+      "description": "Stop at the program's entry point.",
+      "default": false
+    },
+    "justMyCode": {
+      "type": "boolean",
+      "description": "Only step through and break in user code. False also disables the framework's NGen images, so that its code can be stepped into.",
+      "default": true
+    },
+    "enableStepFiltering": {
+      "type": "boolean",
+      "description": "Step over properties and operators.",
+      "default": true
+    },
+    "allowImplicitFuncEval": {
+      "type": "boolean",
+      "description": "Run the program's code (ToString, property getters, DebuggerDisplay) to show values.",
+      "default": true
+    },
+    "suppressJitOptimizations": {
+      "type": "boolean",
+      "description": "Launch without precompiled (ReadyToRun) code."
+    },
+    "sourceFileMap": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "Maps source paths in the symbols to local directories."
+    },
+    "symbolOptions": {
+      "type": "object",
+      "description": "Where to look for symbols that are not next to their modules.",
+      "properties": {
+        "searchPaths": { "type": "array", "items": { "type": "string" } },
+        "cachePath": { "type": "string" },
+        "searchMicrosoftSymbolServer": { "type": "boolean" },
+        "searchNuGetOrgSymbolServer": { "type": "boolean" }
+      }
+    },
+    "processId": {
+      "type": ["integer", "string"],
+      "description": "Process ID to attach to. The process must be 64-bit and have the .NET runtime loaded."
+    }
+  }
+}

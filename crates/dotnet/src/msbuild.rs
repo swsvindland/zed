@@ -54,6 +54,9 @@ pub struct MsBuildProject {
     pub target_frameworks: Vec<String>,
     /// The `OutputPath` of the Debug configuration, for legacy projects.
     pub output_path: Option<String>,
+    /// The `PlatformTarget` of the Debug configuration (`AnyCPU`, `x86`, `x64`), if the project
+    /// sets one.
+    pub platform_target: Option<String>,
     /// Set for ASP.NET (System.Web) web application projects, which run under IIS Express.
     pub web: Option<LegacyWebProject>,
     /// Names of the `launchSettings.json` profiles that `dotnet run` can start.
@@ -82,6 +85,8 @@ pub struct PackageReference {
 pub struct LegacyWebProject {
     pub iis_url: Option<String>,
     pub development_server_port: Option<u16>,
+    /// `Use64BitIISExpress`; unset means Visual Studio's global setting.
+    pub use_64_bit_iis_express: Option<bool>,
 }
 
 impl MsBuildProject {
@@ -216,6 +221,7 @@ pub fn parse_project(path: &Path, contents: &str) -> Result<MsBuildProject> {
         .map(str::to_owned)
         .unwrap_or_else(|| name.clone());
 
+    let platform_target = debug_property(root, "PlatformTarget").map(str::to_owned);
     let (target_frameworks, output_path, web, items) = match style {
         ProjectStyle::Sdk => (target_frameworks.unwrap_or_default(), None, None, None),
         ProjectStyle::Legacy => {
@@ -290,6 +296,7 @@ pub fn parse_project(path: &Path, contents: &str) -> Result<MsBuildProject> {
         assembly_name,
         target_frameworks,
         output_path,
+        platform_target,
         web,
         launch_profiles: Vec::new(),
         output_directories,
@@ -375,6 +382,14 @@ fn is_default_value_condition(condition: &str) -> bool {
 }
 
 fn debug_output_path(root: &XmlElement) -> String {
+    debug_property(root, "OutputPath")
+        .unwrap_or("bin\\Debug\\")
+        .to_owned()
+}
+
+/// The value of `name` in the Debug configuration of a project's default platform, falling back
+/// to any Debug configuration and then to the unconditional value.
+fn debug_property<'a>(root: &'a XmlElement, name: &'a str) -> Option<&'a str> {
     let platform = root
         .children_named("PropertyGroup")
         .filter(|group| group.attribute("Condition").is_none())
@@ -384,23 +399,21 @@ fn debug_output_path(root: &XmlElement) -> String {
         .unwrap_or("AnyCPU");
     let debug_platform_condition = format!("'debug|{}'", platform.to_lowercase());
 
-    let output_path_for = |matches_condition: &dyn Fn(&str) -> bool| {
+    let value_for = |matches_condition: &dyn Fn(&str) -> bool| {
         root.children_named("PropertyGroup")
             .filter(|group| {
                 group.attribute("Condition").is_some_and(|condition| {
                     matches_condition(&condition.replace(' ', "").to_lowercase())
                 })
             })
-            .flat_map(|group| group.children_named("OutputPath"))
-            .map(|output_path| output_path.text.trim())
-            .find(|output_path| !output_path.is_empty())
+            .flat_map(|group| group.children_named(name))
+            .map(|value| value.text.trim())
+            .find(|value| !value.is_empty())
     };
 
-    output_path_for(&|condition| condition.contains(&debug_platform_condition))
-        .or_else(|| output_path_for(&|condition| condition.contains("'debug")))
-        .or_else(|| unconditional_property(root, "OutputPath"))
-        .unwrap_or("bin\\Debug\\")
-        .to_owned()
+    value_for(&|condition| condition.contains(&debug_platform_condition))
+        .or_else(|| value_for(&|condition| condition.contains("'debug")))
+        .or_else(|| unconditional_property(root, name))
 }
 
 fn legacy_web_project(root: &XmlElement) -> Option<LegacyWebProject> {
@@ -430,7 +443,33 @@ fn legacy_web_project(root: &XmlElement) -> Option<LegacyWebProject> {
         iis_url: web_property("IISUrl").map(str::to_owned),
         development_server_port: web_property("DevelopmentServerPort")
             .and_then(|port| port.parse().ok()),
+        use_64_bit_iis_express: debug_property(root, "Use64BitIISExpress")
+            .map(|value| value.eq_ignore_ascii_case("true")),
     })
+}
+
+/// Why `project` has to run in 32-bit IIS Express, which 64-bit debuggers can't debug.
+pub fn iis_express_32_bit_reason(project: &MsBuildProject) -> Option<String> {
+    if project
+        .web
+        .as_ref()
+        .is_some_and(|web| web.use_64_bit_iis_express == Some(false))
+    {
+        return Some(format!(
+            "{} sets Use64BitIISExpress to false, so it runs in 32-bit IIS Express",
+            project.name
+        ));
+    }
+    project
+        .platform_target
+        .as_deref()
+        .filter(|platform| platform.eq_ignore_ascii_case("x86"))
+        .map(|_| {
+            format!(
+                "{} builds for x86 (PlatformTarget), so it only loads into 32-bit IIS Express",
+                project.name
+            )
+        })
 }
 
 /// Returns the names of the `launchSettings.json` profiles `dotnet run --launch-profile` supports.
@@ -704,16 +743,6 @@ pub enum RunKind {
 }
 
 impl RunConfiguration {
-    /// Whether netcoredbg can debug this configuration; it can't debug the .NET Framework.
-    pub fn can_debug(&self) -> bool {
-        match &self.kind {
-            RunKind::DotnetRun { framework, .. } => {
-                !framework.as_deref().is_some_and(is_net_framework)
-            }
-            RunKind::Executable | RunKind::IisExpress => false,
-        }
-    }
-
     pub fn label(&self) -> String {
         let details = match &self.kind {
             RunKind::DotnetRun {
@@ -802,7 +831,7 @@ pub fn run_configurations(project: &MsBuildProject, is_windows: bool) -> Vec<Run
 }
 
 /// Whether `framework` is a .NET Framework moniker (`net48`, `net472`), which only runs on Windows.
-fn is_net_framework(framework: &str) -> bool {
+pub fn is_net_framework(framework: &str) -> bool {
     framework
         .strip_prefix("net")
         .is_some_and(|version| !version.is_empty() && version.chars().all(|c| c.is_ascii_digit()))
@@ -1161,9 +1190,11 @@ mod tests {
                 assembly_name: "Shop.Web".into(),
                 target_frameworks: vec!["v4.7.2".into()],
                 output_path: Some("bin\\".into()),
+                platform_target: None,
                 web: Some(LegacyWebProject {
                     iis_url: Some("https://localhost:44300/".into()),
                     development_server_port: Some(51234),
+                    use_64_bit_iis_express: None,
                 }),
                 launch_profiles: Vec::new(),
                 output_directories: vec!["bin\\".into(), "obj\\".into()],
@@ -1182,6 +1213,53 @@ mod tests {
             vec!["Shop.Web (IIS Express)"]
         );
         assert_eq!(run_configurations(&project, false), Vec::new());
+        assert_eq!(iis_express_32_bit_reason(&project), None);
+    }
+
+    #[test]
+    fn tells_which_web_projects_need_32_bit_iis_express() {
+        let path = root().join("Shop.Web").join("Shop.Web.csproj");
+        let with_properties = |unconditional: &str, debug: &str| {
+            let contents = LEGACY_WEB_PROJECT
+                .replace(
+                    "<UseIISExpress>true</UseIISExpress>",
+                    &format!("<UseIISExpress>true</UseIISExpress>{unconditional}"),
+                )
+                .replace(
+                    "<DebugSymbols>true</DebugSymbols>",
+                    &format!("<DebugSymbols>true</DebugSymbols>{debug}"),
+                );
+            parse_project(&path, &contents).unwrap()
+        };
+
+        let project = with_properties("<Use64BitIISExpress />", "");
+        assert_eq!(project.web.as_ref().unwrap().use_64_bit_iis_express, None);
+        assert_eq!(iis_express_32_bit_reason(&project), None);
+
+        let project = with_properties("<Use64BitIISExpress>true</Use64BitIISExpress>", "");
+        assert_eq!(
+            project.web.as_ref().unwrap().use_64_bit_iis_express,
+            Some(true)
+        );
+        assert_eq!(iis_express_32_bit_reason(&project), None);
+
+        let project = with_properties("<Use64BitIISExpress>false</Use64BitIISExpress>", "");
+        assert_eq!(
+            iis_express_32_bit_reason(&project).as_deref(),
+            Some("Shop.Web sets Use64BitIISExpress to false, so it runs in 32-bit IIS Express")
+        );
+
+        let project = with_properties("", "<PlatformTarget>x86</PlatformTarget>");
+        assert_eq!(project.platform_target.as_deref(), Some("x86"));
+        assert_eq!(
+            iis_express_32_bit_reason(&project).as_deref(),
+            Some(
+                "Shop.Web builds for x86 (PlatformTarget), so it only loads into 32-bit IIS Express"
+            )
+        );
+
+        let project = with_properties("", "<PlatformTarget>AnyCPU</PlatformTarget>");
+        assert_eq!(iis_express_32_bit_reason(&project), None);
     }
 
     #[test]

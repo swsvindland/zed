@@ -6,8 +6,9 @@ C# support for this Zed fork:
 - **MSBuild** (`.csproj`, `.fsproj`, `.vbproj`, `.proj`, `.props`, `.targets`, `.slnx`) and **XML** (`.xml`, `.config`, `.resx`, `.nuspec`, `.xaml`, …) with [tree-sitter-xml](https://github.com/tree-sitter-grammars/tree-sitter-xml).
 - **Roslyn** (`Microsoft.CodeAnalysis.LanguageServer`, MIT) as the language server. The extension downloads the `roslyn-language-server.<rid>` package from nuget.org into its work directory and starts it with `--autoLoadProjects`, so it finds the solution or projects in the worktree by itself.
 - **netcoredbg** (MIT, Samsung) as the `netcoredbg` debug adapter for .NET (Core) programs, downloaded from its GitHub releases.
+- **dotnet-debugger** (MIT, [dvislobokov/dotnet-debugger](https://github.com/dvislobokov/dotnet-debugger)) as the `dotnet-debugger` debug adapter for .NET Framework 4.x programs. It's an ICorDebug-based adapter; the extension downloads its `dotnet-debugger-dap` tool package from nuget.org and runs it with `dotnet` (.NET 8 or later).
 
-Run and debug of projects (`dotnet: run`, `dotnet: debug`, the run configuration in the status bar, and the `dotnet run` → netcoredbg locator) live in the native [`dotnet`](../../crates/dotnet) crate, because the extension sandbox can only read the extension's own directory and so can't read `launchSettings.json` or find a file's project.
+Run and debug of projects (`dotnet: run`, `dotnet: debug`, the run configuration in the status bar, and the `dotnet run` → debugger locator) live in the native [`dotnet`](../../crates/dotnet) crate, because the extension sandbox can only read the extension's own directory and so can't read `launchSettings.json` or find a file's project.
 
 Queries and the NuGet download code are adapted from [zed-extensions/csharp](https://github.com/zed-extensions/csharp) (Apache-2.0).
 
@@ -36,8 +37,19 @@ For anything that needs the right project from any file, use the `dotnet:` actio
 
 ## Debugging
 
-- `dotnet: debug` (or the bug button next to the run configuration in the status bar) builds the selected project and launch profile and starts it under netcoredbg.
-- In `debugger: start`, every `dotnet run` task (for example the gutter's `dotnet run`, or the MSBuild file's `dotnet run --project`) can also be debugged: the `dotnet-locator` turns it into a `dotnet build` followed by a netcoredbg launch.
+`dotnet: debug` (or the bug button next to the run configuration in the status bar) builds the selected run configuration and starts it under the debugger that fits its target framework:
+
+| Run configuration | Build | Debugger |
+| --- | --- | --- |
+| SDK project, .NET (Core) | `dotnet build` | netcoredbg launches it |
+| SDK project, `net4x` | `dotnet build` | dotnet-debugger launches it |
+| Legacy console or desktop app | MSBuild.exe | dotnet-debugger launches it from its output directory |
+| Legacy web project (Web Forms, MVC 5) | MSBuild.exe | 64-bit IIS Express starts in a terminal, then dotnet-debugger attaches to it |
+
+- In `debugger: start`, every `dotnet run` task (for example the gutter's `dotnet run`, or the MSBuild file's `dotnet run --project`) can also be debugged: the `dotnet-locator` turns it into a `dotnet build` followed by a launch. The locator reads the project to pick dotnet-debugger for `net4x` and netcoredbg otherwise; for a task whose folder is still a variable (the gutter's `$ZED_DIRNAME`), it uses netcoredbg and says so if the program turns out to be .NET Framework. Making dotnet-debugger the C# debugger in your settings (`"languages": { "C#": { "debuggers": ["dotnet-debugger"] } }`) uses it for .NET 8+ too.
+- `dotnet: attach to IIS Express` attaches dotnet-debugger to a site that is already running in IIS Express, such as one `dotnet: run` or Visual Studio started. With several IIS Express processes running, it asks which one, by their `/site:` or `/path:` argument. It refuses the 32-bit IIS Express (`C:\Program Files (x86)\IIS Express`) and says why.
+- To attach to any other process, open `debugger: start`, choose the **Attach** tab and pick the process, such as `w3wp.exe` or your app. In a C# file, the debugger dropdown at its bottom right (and on the **Launch** tab) starts on `dotnet-debugger`, which debugs .NET Framework and .NET 8+ processes; pick `netcoredbg` for older .NET (Core). A `.zed/debug.json` scenario with `"request": "attach", "processId": "$ZED_PICK_PID"` opens the same picker.
+- Stopping a session ends the debugged process, attached or not; that's how stopping an IIS Express session stops the site. Use **Disconnect** in the debug panel to detach instead.
 - `.zed/debug.json` scenarios work too:
 
   ```json
@@ -53,7 +65,15 @@ For anything that needs the right project from any file, use the `dotnet:` actio
   ]
   ```
 
-netcoredbg can't debug .NET Framework programs; that needs a separate ICorDebug-based adapter.
+  For a .NET Framework program, use `"adapter": "dotnet-debugger"` and point `program` at its `.exe`. dotnet-debugger also takes `"project"` (with `"build": true`) instead of `program`, `"console": "integratedTerminal"` for a program that reads standard input, and `justMyCode`, `symbolOptions` and `sourceFileMap`; see [its schema](debug_adapter_schemas/dotnet-debugger.json).
+
+### .NET Framework limits
+
+dotnet-debugger debugs both Windows (full/pdbonly) and portable PDBs, several AppDomains (ASP.NET runs each site in its own), async code and exceptions. It only debugs **64-bit processes**:
+
+- A console or desktop app built for `x86`, or for `AnyCPU` with `Prefer32Bit` (the default of older Visual Studio templates), is refused when it starts, with a message that says so. Set `<Prefer32Bit>false</Prefer32Bit>` in its Debug configuration, unless it really needs 32-bit (32-bit COM components, Jet or old Oracle drivers).
+- Web projects are served by the 64-bit IIS Express, `C:\Program Files\IIS Express\iisexpress.exe`. `dotnet: debug` refuses projects that set `Use64BitIISExpress` to `false` or build for `x86`, and says why; `dotnet: run` still runs them.
+- .NET Framework 3.5 and earlier (CLR 2) can't be debugged.
 
 ## Settings
 
@@ -70,11 +90,14 @@ Roslyn options use their VS Code names, either flat or grouped by `language|cate
       "binary": { "path": "C:/tools/roslyn/Microsoft.CodeAnalysis.LanguageServer.exe" }
     }
   },
-  "debugger": { "dap": { "netcoredbg": { "binary": "C:/tools/netcoredbg/netcoredbg.exe" } } }
+  "dap": {
+    "netcoredbg": { "binary": "C:/tools/netcoredbg/netcoredbg.exe" },
+    "dotnet-debugger": { "binary": "C:/src/dotnet-debugger/artifacts/publish/win-x64/dotnet-debugger.exe" }
+  }
 }
 ```
 
-A `binary.path` replaces the downloaded server; `binary.arguments` replaces the default `--stdio --autoLoadProjects --logLevel=Information`. A `netcoredbg` on `PATH` is used before downloading one.
+A `binary.path` replaces the downloaded server; `binary.arguments` replaces the default `--stdio --autoLoadProjects --logLevel=Information`. A `netcoredbg` on `PATH` is used before downloading one, and so is a `dotnet-debugger` on `PATH` (`dotnet tool install -g dotnet-debugger-dap`). A `dotnet-debugger` binary that ends in `.dll` is run with `dotnet`.
 
 ## Testing
 
@@ -89,5 +112,7 @@ Then install it as a dev extension (above) and check, on a sample such as `dotne
 - completions and diagnostics from Roslyn (introduce a type error);
 - a breakpoint hit through `dotnet: debug`;
 - the gutter test buttons in an xUnit project.
+
+For .NET Framework debugging, use a legacy (non-SDK) `net48` console project and a Web Forms project, both built with MSBuild.exe: a breakpoint in `Main` and in `Page_Load` should stop through `dotnet: debug`, with locals, the call stack and stepping working. Build the console app with both `<DebugType>full</DebugType>` and `portable`.
 
 Razor (`.razor`, `.cshtml`) language support is not included yet. Roslyn serves Razor through Razor's "cohosting" assemblies (`Microsoft.VisualStudioCode.RazorExtension`), which ship inside VS Code C# extension releases; nuget.org only has one 2025 preview of them, so they would have to be downloaded in a version that matches the Roslyn build.

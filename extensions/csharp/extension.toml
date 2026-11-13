@@ -1,6 +1,6 @@
 id = "csharp-dotnet"
 name = "C# (.NET)"
-description = "C# support with Roslyn, netcoredbg debugging and MSBuild files."
+description = "C# support with Roslyn, netcoredbg and dotnet-debugger debugging, and MSBuild files."
 version = "0.1.0"
 schema_version = 1
 authors = ["Sam Svindland <swsvindland@gmail.com>"]
@@ -14,6 +14,8 @@ languages = ["C#"]
 "C#" = "csharp"
 
 [debug_adapters.netcoredbg]
+
+[debug_adapters.dotnet-debugger]
 
 [grammars.c_sharp]
 repository = "https://github.com/tree-sitter/tree-sitter-c-sharp"

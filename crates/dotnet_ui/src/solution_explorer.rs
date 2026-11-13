@@ -496,13 +496,11 @@ impl SolutionExplorer {
                                 None,
                                 start(configuration.clone(), false),
                             );
-                            if configuration.can_debug() {
-                                menu = menu.entry(
-                                    format!("Debug {}", configuration.label()),
-                                    None,
-                                    start(configuration.clone(), true),
-                                );
-                            }
+                            menu = menu.entry(
+                                format!("Debug {}", configuration.label()),
+                                None,
+                                start(configuration.clone(), true),
+                            );
                         }
                         if let Some(configuration) = configurations.first().cloned() {
                             let projects = projects.clone();
@@ -611,9 +609,6 @@ impl SolutionExplorer {
             .active_run_configuration()
             .map(RunConfiguration::label)
             .unwrap_or_else(|| "No startup project".into());
-        let can_debug = model
-            .active_run_configuration()
-            .is_some_and(RunConfiguration::can_debug);
         h_flex()
             .px_2()
             .py_1()
@@ -638,7 +633,6 @@ impl SolutionExplorer {
             .child(
                 IconButton::new("solution-explorer-debug", IconName::Debug)
                     .icon_size(IconSize::Small)
-                    .disabled(!can_debug)
                     .tooltip(Tooltip::for_action_title("Debug", &dotnet::Debug))
                     .on_click(|_, window, cx| {
                         window.dispatch_action(dotnet::Debug.boxed_clone(), cx)
@@ -827,9 +821,11 @@ impl Render for SolutionExplorer {
                 .gap_2()
                 .child(Label::new("No .NET solutions or projects found."))
                 .child(
-                    Label::new("Open a solution, or a folder that contains a .sln, .slnx or project file.")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
+                    Label::new(
+                        "Open a solution, or a folder that contains a .sln, .slnx or project file.",
+                    )
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
                 )
                 .child(
                     Button::new("solution-explorer-open-solution", "Open Solution…").on_click(
