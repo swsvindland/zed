@@ -1469,6 +1469,71 @@ fn test_syntax_map_languages_loading_with_erb(cx: &mut App) {
     );
 }
 
+#[gpui::test]
+fn test_syntax_map_resolving_nested_injection_before_shallower_ones(cx: &mut App) {
+    // The pending Ruby injection in `<script>` is nested inside the combined HTML layer, and
+    // starts before the pending Ruby injections of the ERB tags further down.
+    let text = r#"
+        <body>
+            <script>
+                @two
+            </script>
+            <p>one</p>
+            <p>two</p>
+            <p>three</p>
+            <% if @one %>
+            <% end %>
+        </body>
+    "#
+    .unindent();
+
+    let registry = Arc::new(LanguageRegistry::test(cx.background_executor().clone()));
+    let buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), text);
+
+    let mut syntax_map = SyntaxMap::new(&buffer);
+    syntax_map.set_language_registry(registry.clone());
+
+    let language = Arc::new(erb_lang());
+    registry.add(language.clone());
+    syntax_map.reparse(language.clone(), &buffer);
+
+    registry.add(Arc::new(
+        html_lang()
+            .with_injection_query(
+                r#"
+                    (script_element
+                        (raw_text) @injection.content
+                        (#set! injection.language "ruby"))
+                "#,
+            )
+            .unwrap(),
+    ));
+    syntax_map.reparse(language.clone(), &buffer);
+    assert!(syntax_map.contains_unknown_injections());
+
+    registry.add(Arc::new(ruby_lang()));
+    syntax_map.reparse(language, &buffer);
+    assert!(!syntax_map.contains_unknown_injections());
+
+    assert_capture_ranges(
+        &syntax_map,
+        &buffer,
+        &["tag", "ivar"],
+        "
+            <«body»>
+                <«script»>
+                    «@two»
+                </«script»>
+                <«p»>one</«p»>
+                <«p»>two</«p»>
+                <«p»>three</«p»>
+                <% if «@one» %>
+                <% end %>
+            </«body»>
+        ",
+    );
+}
+
 #[gpui::test(iterations = 50)]
 fn test_random_syntax_map_edits_rust_macros(rng: StdRng, cx: &mut App) {
     let text = r#"

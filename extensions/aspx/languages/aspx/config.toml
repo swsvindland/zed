@@ -1,0 +1,11 @@
+name = "ASPX"
+grammar = "embedded_template"
+path_suffixes = ["aspx", "ascx", "master", "asax"]
+block_comment = { start = "<%-- ", prefix = "", end = " --%>", tab_size = 0 }
+autoclose_before = ">})"
+brackets = [
+    { start = "{", end = "}", close = true, newline = true },
+    { start = "[", end = "]", close = true, newline = true },
+    { start = "(", end = ")", close = true, newline = true },
+    { start = "\"", end = "\"", close = true, newline = false },
+]

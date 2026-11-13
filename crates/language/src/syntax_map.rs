@@ -612,6 +612,11 @@ impl SyntaxSnapshot {
             }
             drop(cursor);
 
+            // The cursor visits layers by depth, so a nested injection that precedes a shallower
+            // one in the buffer is collected after it. `reparse_with_ranges` merges the ranges
+            // as if they were sorted, and would fold the out-of-order one into its predecessor.
+            resolved_injection_ranges.sort_unstable_by_key(|range| range.start);
+
             if !resolved_injection_ranges.is_empty() {
                 self.reparse_with_ranges(
                     text,
