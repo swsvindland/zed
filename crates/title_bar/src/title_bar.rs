@@ -1380,7 +1380,6 @@ impl TitleBar {
                                 },
                                 {
                                     let user_store = user_store.clone();
-                                    let organization = organization.clone();
                                     let workspace = workspace.clone();
                                     move |window, cx| {
                                         let task = user_store.update(cx, |user_store, cx| {
