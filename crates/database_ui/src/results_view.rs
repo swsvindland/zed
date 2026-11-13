@@ -1,20 +1,23 @@
 //! The results pane shown under a SQL console: one grid per result set plus a messages tab.
-//! A result read from a single table with a primary key can be edited in place and pushed back.
+//! Rows arrive a page at a time (see [`database::Execution`]). A result read from a single table
+//! with a primary key can be edited in place and pushed back.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
-    time::Duration,
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    time::{Duration, Instant},
 };
 
+use anyhow::anyhow;
 use database::{
-    ConnectionProfile, EditTarget, Editability, PoolKey, ResultSet, StatementOutcome,
+    ColumnInfo, ConnectionProfile, EditTarget, Editability, ExecutionEnd, ExecutionEvent,
+    ExecutionHandle, Fetch, PoolKey, ResultSet,
     sql::{self, ParameterizedStatement, RowChange},
 };
 use editor::{Editor, EditorEvent, MultiBufferOffset, SelectionEffects};
-use futures::FutureExt as _;
+use futures::{FutureExt as _, StreamExt as _, channel::oneshot};
 use gpui::{
-    App, AppContext as _, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, Render,
-    SharedString, Subscription, Task, WeakEntity, Window,
+    App, AppContext as _, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, Global,
+    Render, SharedString, Subscription, Task, WeakEntity, Window,
 };
 use tabular_data_preview::{
     CellDecoration, TableView, TableViewEvent,
@@ -31,8 +34,28 @@ use crate::{
     push_modal::PushReviewModal,
 };
 
-pub(crate) const NULL_TEXT: &str = "NULL";
+gpui::actions!(
+    database,
+    [
+        /// Stops the running statement, or closes a result that is waiting at the fetch limit.
+        StopStatement,
+        /// Fetches the next page of a result that stopped at the fetch limit.
+        FetchNextPage,
+        /// Fetches every remaining row of a result that stopped at the fetch limit.
+        FetchAllRows,
+    ]
+);
+
 const DEFAULT_TEXT: &str = "(default)";
+/// While rows stream in, the grid is rebuilt at most this often.
+const GRID_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Consoles (by buffer) whose statement is running or holding an open result, so the console
+/// toolbar can offer Stop.
+#[derive(Default)]
+pub(crate) struct ActiveConsoleRuns(pub HashSet<EntityId>);
+
+impl Global for ActiveConsoleRuns {}
 
 /// Unsaved changes to an editable result set.
 #[derive(Default)]
@@ -58,15 +81,35 @@ impl PendingEdits {
 
 struct ResultSetView {
     result: ResultSet,
+    /// Grid cells for `result.rows`, converted once as each page arrives.
+    cells: Vec<TableRow<TableCell>>,
+    /// Rows arrived since the grid was last rebuilt.
+    grid_stale: bool,
     table: Entity<TableView>,
     edits: PendingEdits,
     _subscription: Subscription,
+}
+
+impl ResultSetView {
+    fn append(&mut self, rows: Vec<Vec<Option<String>>>) {
+        let columns = self.result.columns.len();
+        self.cells.extend(
+            rows.iter()
+                .map(|row| table_row(row.iter().map(value_cell), columns)),
+        );
+        self.result.rows.extend(rows);
+        self.grid_stale = true;
+    }
 }
 
 struct CellEdit {
     set_index: usize,
     cell: DataCellId,
     editor: Entity<Editor>,
+    /// Leaving a NULL (or a new row's unset) cell without typing keeps it as it was, instead of
+    /// turning it into an empty string.
+    keeps_value_unless_edited: bool,
+    edited: bool,
     _subscription: Subscription,
 }
 
@@ -76,11 +119,38 @@ enum Tab {
     Messages,
 }
 
+#[derive(Clone, PartialEq, Eq)]
 enum RunState {
     Idle,
-    Running(#[allow(dead_code)] Task<()>),
+    /// The server is working, or rows are streaming in.
+    Running,
+    /// The latest result stopped at the fetch limit and has more rows on the server.
+    Paused,
+    Stopping,
     Finished,
+    /// Stopped early, on request or by the query timeout.
+    Stopped(SharedString),
     Failed,
+}
+
+impl RunState {
+    fn is_active(&self) -> bool {
+        matches!(
+            self,
+            RunState::Running | RunState::Paused | RunState::Stopping
+        )
+    }
+}
+
+/// A run in progress. Dropping it cancels the statement.
+struct ActiveRun {
+    handle: ExecutionHandle,
+    _task: Task<anyhow::Result<()>>,
+}
+
+enum Outcome {
+    ResultSet(usize),
+    RowsAffected(u64),
 }
 
 pub struct QueryResultsView {
@@ -89,8 +159,17 @@ pub struct QueryResultsView {
     target: ConsoleTarget,
     sql: String,
     state: RunState,
+    run: Option<ActiveRun>,
+    fetch_limit: Option<usize>,
+    /// Time the run has spent waiting at the fetch limit, which isn't query time.
+    paused_for: Duration,
+    paused_since: Option<Instant>,
     elapsed: Option<Duration>,
     result_sets: Vec<ResultSetView>,
+    outcomes: Vec<Outcome>,
+    error: Option<SharedString>,
+    /// Lines shown above the outcomes, such as discarded edits.
+    notes: Vec<SharedString>,
     messages: Vec<SharedString>,
     /// Whether the single result set can be edited; `None` when several statements ran.
     editability: Option<Editability>,
@@ -99,10 +178,21 @@ pub struct QueryResultsView {
     notice: Option<SharedString>,
     push_task: Option<Task<()>>,
     active_tab: Tab,
+    last_grid_refresh: Instant,
+    grid_refresh: Option<Task<()>>,
     focus_handle: FocusHandle,
+    _release: Subscription,
 }
 
 impl QueryResultsView {
+    pub fn find(workspace: &Workspace, buffer_id: EntityId, cx: &App) -> Option<Entity<Self>> {
+        workspace.panes().iter().find_map(|pane| {
+            pane.read(cx)
+                .items_of_type::<QueryResultsView>()
+                .find(|view| view.read(cx).buffer_id == buffer_id)
+        })
+    }
+
     pub fn find_or_create(
         workspace: &mut Workspace,
         editor: &Entity<Editor>,
@@ -134,15 +224,26 @@ impl QueryResultsView {
             target,
             sql: String::new(),
             state: RunState::Idle,
+            run: None,
+            fetch_limit: None,
+            paused_for: Duration::ZERO,
+            paused_since: None,
             elapsed: None,
             result_sets: Vec::new(),
+            outcomes: Vec::new(),
+            error: None,
+            notes: Vec::new(),
             messages: Vec::new(),
             editability: None,
             editing: None,
             notice: None,
             push_task: None,
             active_tab: Tab::Messages,
+            last_grid_refresh: Instant::now(),
+            grid_refresh: None,
             focus_handle: cx.focus_handle(),
+            // Closing the pane cancels its run, so its console no longer offers Stop.
+            _release: cx.on_release(|this: &mut Self, cx| this.set_console_active(false, cx)),
         });
         let editor_pane = workspace
             .pane_for(editor)
@@ -184,133 +285,381 @@ impl QueryResultsView {
     }
 
     pub fn run(&mut self, sql: String, window: &mut Window, cx: &mut Context<Self>) {
-        if self.pending_row_count() > 0 {
-            self.messages
-                .push("Discarded unsaved grid edits by running a new query.".into());
-        }
+        let discarded_edits = self.pending_row_count() > 0;
+        // Cancels the previous run; it finishes on its own before this one gets the session.
+        self.run = None;
+        self.grid_refresh = None;
         self.editing = None;
         self.notice = None;
         self.sql = sql.clone();
+        self.notes = if discarded_edits {
+            vec!["Discarded unsaved grid edits by running a new query.".into()]
+        } else {
+            Vec::new()
+        };
+        self.result_sets.clear();
+        self.outcomes.clear();
+        self.error = None;
+        self.editability = None;
+        self.elapsed = None;
+        self.paused_for = Duration::ZERO;
+        self.paused_since = None;
+        self.active_tab = Tab::Messages;
+        // The first rows of a run show at once; only later updates are throttled.
+        self.last_grid_refresh = Instant::now()
+            .checked_sub(GRID_REFRESH_INTERVAL)
+            .unwrap_or_else(Instant::now);
+
+        let Some(profile) = self.profile(cx) else {
+            self.finish_run(
+                Err(anyhow!("This console's connection no longer exists.")),
+                Duration::ZERO,
+                cx,
+            );
+            return;
+        };
+        let options = profile.execution_options();
+        self.fetch_limit = options.fetch_limit;
+        // Describing first keeps the session free for the statement, which may hold it open at
+        // the fetch limit.
+        let describe = sql::split_statements(&sql, profile.driver.dialect()).len() == 1
+            && sql::may_return_rows(&sql);
+        let (handle, mut execution, mut events) = database::execution(options);
+        let (editability_sender, editability_receiver) = oneshot::channel();
         let task = DatabaseStore::global(cx).update(cx, |store, cx| {
             store.with_client(
                 self.pool_key(),
                 move |client| {
                     async move {
-                        let output = client.run(&sql).await?;
-                        let editability = match output.outcomes.as_slice() {
-                            [StatementOutcome::Rows(result)] => Some(
+                        let editability = if describe {
+                            Some(
                                 client
-                                    .editability(&sql, result)
+                                    .editability(&sql)
                                     .await
                                     .unwrap_or_else(|error| Err(format!("{error:#}"))),
-                            ),
-                            _ => None,
+                            )
+                        } else {
+                            None
                         };
-                        Ok((output, editability))
+                        if editability_sender.send(editability).is_err() {
+                            log::debug!("the results view closed before the query ran");
+                        }
+                        client.execute(&sql, &mut execution).await
                     }
                     .boxed()
                 },
                 cx,
             )
         });
-        self.state = RunState::Running(cx.spawn_in(window, async move |this, cx| {
-            let result = task.await;
-            this.update_in(cx, |this, window, cx| {
-                match result {
-                    Ok((output, editability)) => this.show_output(output, editability, window, cx),
-                    Err(error) => {
-                        this.state = RunState::Failed;
-                        this.messages = vec![format!("Error: {error:#}").into()];
-                        this.active_tab = Tab::Messages;
-                    }
-                }
+        // A run dropped mid-statement would leave its session out of sync with the server, so it
+        // always runs to the end; dropping the handle along with this view cancels it instead.
+        let (result_sender, result_receiver) = oneshot::channel();
+        cx.background_spawn(async move {
+            if result_sender.send(task.await).is_err() {
+                log::debug!("the results view closed before the query finished");
+            }
+        })
+        .detach();
+
+        let started = Instant::now();
+        let task = cx.spawn_in(window, async move |this, cx| {
+            let editability = editability_receiver.await.ok().flatten();
+            this.update(cx, |this, cx| {
+                this.editability = editability;
                 cx.notify();
+            })?;
+            while let Some(event) = events.next().await {
+                let mut batch = vec![event];
+                while let Ok(event) = events.try_recv() {
+                    batch.push(event);
+                }
+                this.update_in(cx, |this, window, cx| this.apply_events(batch, window, cx))?;
+            }
+            let result = result_receiver
+                .await
+                .unwrap_or_else(|_| Err(anyhow!("the query was abandoned")));
+            this.update(cx, |this, cx| {
+                this.finish_run(result, started.elapsed(), cx)
             })
-            .log_err();
-        }));
+        });
+        self.run = Some(ActiveRun {
+            handle,
+            _task: task,
+        });
+        self.state = RunState::Running;
+        self.set_console_active(true, cx);
+        self.rebuild_messages();
         cx.notify();
     }
 
-    fn show_output(
+    fn set_console_active(&self, active: bool, cx: &mut App) {
+        let runs = &mut cx.default_global::<ActiveConsoleRuns>().0;
+        if active {
+            runs.insert(self.buffer_id);
+        } else {
+            runs.remove(&self.buffer_id);
+        }
+    }
+
+    fn apply_events(
         &mut self,
-        output: database::QueryOutput,
-        editability: Option<Editability>,
+        events: Vec<ExecutionEvent>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.elapsed = Some(output.elapsed);
-        self.messages.clear();
-        let mut result_sets = Vec::new();
-        for outcome in output.outcomes {
-            match outcome {
-                StatementOutcome::Rows(result) => {
-                    let set_index = result_sets.len();
-                    self.messages.push(
-                        format!(
-                            "Result {}: {} {}",
-                            set_index + 1,
-                            result.rows.len(),
-                            if result.rows.len() == 1 {
-                                "row"
-                            } else {
-                                "rows"
-                            }
-                        )
-                        .into(),
-                    );
-                    let content = table_content(&result, &PendingEdits::default());
-                    let table = cx.new(|cx| {
-                        let mut table = TableView::new(window, cx);
-                        table.set_selection_enabled(true);
-                        table.set_contents(content, cx);
-                        table
-                    });
-                    let subscription = cx.subscribe_in(
-                        &table,
-                        window,
-                        move |this, _, event: &TableViewEvent, window, cx| match event {
-                            TableViewEvent::EditRequested { cell, initial_text } => {
-                                this.start_edit(set_index, *cell, initial_text.clone(), window, cx);
-                            }
-                        },
-                    );
-                    result_sets.push(ResultSetView {
-                        result,
-                        table,
-                        edits: PendingEdits::default(),
-                        _subscription: subscription,
-                    });
+        for event in events {
+            match event {
+                ExecutionEvent::ResultSet(columns) => self.add_result_set(columns, window, cx),
+                ExecutionEvent::Rows(rows) => {
+                    let Some(set_index) = self.result_sets.len().checked_sub(1) else {
+                        continue;
+                    };
+                    // New rows go before the unsaved new rows, so an edit of one would move.
+                    if self.editing.as_ref().is_some_and(|edit| {
+                        edit.set_index == set_index
+                            && self
+                                .result_sets
+                                .get(set_index)
+                                .is_some_and(|set| edit.cell.row.0 >= set.result.rows.len())
+                    }) {
+                        self.commit_edit(window, cx);
+                    }
+                    if let Some(set) = self.result_sets.get_mut(set_index) {
+                        set.append(rows);
+                    }
                 }
-                StatementOutcome::RowsAffected(count) => self.messages.push(
-                    format!(
-                        "{count} {} affected",
-                        if count == 1 { "row" } else { "rows" }
-                    )
-                    .into(),
-                ),
-                StatementOutcome::Completed => {
-                    self.messages.push("Statement completed".into());
+                ExecutionEvent::RowsAffected(count) => {
+                    self.outcomes.push(Outcome::RowsAffected(count));
+                }
+                ExecutionEvent::Paused => {
+                    if self.state == RunState::Running {
+                        self.state = RunState::Paused;
+                        self.paused_since = Some(Instant::now());
+                    }
                 }
             }
         }
-        self.messages
-            .push(format!("Finished in {}", format_duration(output.elapsed)).into());
-        self.result_sets = result_sets;
-        self.editability = editability;
-        self.active_tab = if self.result_sets.is_empty() {
-            Tab::Messages
-        } else {
-            Tab::Result(0)
-        };
-        self.state = RunState::Finished;
-        for index in 0..self.result_sets.len() {
-            self.refresh_decorations(index, cx);
+        let streaming = self.state == RunState::Running;
+        self.refresh_stale_grids(!streaming, cx);
+        self.rebuild_messages();
+        cx.notify();
+    }
+
+    fn add_result_set(
+        &mut self,
+        columns: Vec<ColumnInfo>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let set_index = self.result_sets.len();
+        let table = cx.new(|cx| {
+            let mut table = TableView::new(window, cx);
+            table.set_selection_enabled(true);
+            table
+        });
+        let subscription = cx.subscribe_in(
+            &table,
+            window,
+            move |this, _, event: &TableViewEvent, window, cx| match event {
+                TableViewEvent::EditRequested { cell, initial_text } => {
+                    this.start_edit(set_index, *cell, initial_text.clone(), window, cx);
+                }
+            },
+        );
+        self.result_sets.push(ResultSetView {
+            result: ResultSet {
+                columns,
+                rows: Vec::new(),
+            },
+            cells: Vec::new(),
+            grid_stale: true,
+            table,
+            edits: PendingEdits::default(),
+            _subscription: subscription,
+        });
+        self.outcomes.push(Outcome::ResultSet(set_index));
+        if set_index == 0 {
+            self.active_tab = Tab::Result(0);
         }
+    }
+
+    /// Rebuilds grids that have new rows, at most every [`GRID_REFRESH_INTERVAL`] unless
+    /// `now`, since each rebuild copies every row.
+    fn refresh_stale_grids(&mut self, now: bool, cx: &mut Context<Self>) {
+        if !self.result_sets.iter().any(|set| set.grid_stale) {
+            return;
+        }
+        let since_last = self.last_grid_refresh.elapsed();
+        if !now && since_last < GRID_REFRESH_INTERVAL {
+            if self.grid_refresh.is_none() {
+                let delay = GRID_REFRESH_INTERVAL - since_last;
+                self.grid_refresh = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(delay).await;
+                    this.update(cx, |this, cx| {
+                        this.grid_refresh = None;
+                        this.refresh_stale_grids(true, cx);
+                    })
+                    .log_err();
+                }));
+            }
+            return;
+        }
+        self.grid_refresh = None;
+        self.last_grid_refresh = Instant::now();
+        for index in 0..self.result_sets.len() {
+            if self
+                .result_sets
+                .get(index)
+                .is_some_and(|set| set.grid_stale)
+            {
+                self.reload_table(index, cx);
+            }
+        }
+    }
+
+    fn finish_run(
+        &mut self,
+        result: anyhow::Result<ExecutionEnd>,
+        elapsed: Duration,
+        cx: &mut Context<Self>,
+    ) {
+        self.run = None;
+        self.set_console_active(false, cx);
+        let paused = self.paused_for
+            + self
+                .paused_since
+                .take()
+                .map_or(Duration::ZERO, |since| since.elapsed());
+        self.elapsed = Some(elapsed.saturating_sub(paused));
+        // Even a failed script may have changed the schema before it stopped.
+        if let Some(profile) = self.profile(cx)
+            && database::completion::may_change_schema(&self.sql, profile.driver.dialect())
+            && let Some(store) = DatabaseStore::try_global(cx)
+        {
+            let target = self.target.clone();
+            store.update(cx, |store, _| {
+                store.invalidate_catalog(&target.connection_id, Some(&target.database))
+            });
+        }
+        match result {
+            Ok(ExecutionEnd::Completed) => self.state = RunState::Finished,
+            Ok(ExecutionEnd::Cancelled) => self.state = RunState::Stopped("Stopped".into()),
+            Ok(ExecutionEnd::TimedOut(timeout)) => {
+                self.state = RunState::Stopped(
+                    format!(
+                        "Cancelled by the {}-second query timeout",
+                        timeout.as_secs()
+                    )
+                    .into(),
+                )
+            }
+            Err(error) => {
+                self.state = RunState::Failed;
+                self.error = Some(format!("{error:#}").into());
+                self.active_tab = Tab::Messages;
+            }
+        }
+        self.refresh_stale_grids(true, cx);
+        self.rebuild_messages();
+        cx.notify();
+    }
+
+    fn rebuild_messages(&mut self) {
+        let mut messages = self.notes.clone();
+        let last_set = self.result_sets.len().checked_sub(1);
+        for outcome in &self.outcomes {
+            match outcome {
+                Outcome::ResultSet(index) => {
+                    let rows = self
+                        .result_sets
+                        .get(*index)
+                        .map_or(0, |set| set.result.rows.len());
+                    let more = if self.state == RunState::Paused && last_set == Some(*index) {
+                        " so far; more on the server"
+                    } else {
+                        ""
+                    };
+                    messages.push(
+                        format!("Result {}: {}{more}", index + 1, row_count_text(rows)).into(),
+                    );
+                }
+                Outcome::RowsAffected(count) => messages.push(
+                    format!(
+                        "{count} {} affected",
+                        if *count == 1 { "row" } else { "rows" }
+                    )
+                    .into(),
+                ),
+            }
+        }
+        if self.outcomes.is_empty() && self.state == RunState::Finished {
+            messages.push("Statement completed".into());
+        }
+        if let Some(error) = &self.error {
+            messages.push(format!("Error: {error}").into());
+        }
+        if let RunState::Stopped(reason) = &self.state {
+            messages.push(reason.clone());
+        }
+        if let Some(elapsed) = self.elapsed {
+            let verb = if matches!(self.state, RunState::Stopped(_)) {
+                "Ran for"
+            } else {
+                "Finished in"
+            };
+            messages.push(format!("{verb} {}", format_duration(elapsed)).into());
+        }
+        self.messages = messages;
+    }
+
+    fn stop(&mut self, cx: &mut Context<Self>) {
+        let Some(run) = &self.run else {
+            return;
+        };
+        run.handle.cancel();
+        if matches!(self.state, RunState::Running | RunState::Paused) {
+            self.state = RunState::Stopping;
+        }
+        cx.notify();
+    }
+
+    fn fetch(&mut self, fetch: Fetch, window: &mut Window, cx: &mut Context<Self>) {
+        if self.state != RunState::Paused {
+            return;
+        }
+        self.commit_edit(window, cx);
+        if let Some(since) = self.paused_since.take() {
+            self.paused_for += since.elapsed();
+        }
+        if let Some(run) = &self.run {
+            run.handle.fetch(fetch);
+            self.state = RunState::Running;
+            self.rebuild_messages();
+            cx.notify();
+        }
+    }
+
+    /// Stops the statement or open result, if any. Returns whether there was one.
+    pub(crate) fn stop_if_running(&mut self, cx: &mut Context<Self>) -> bool {
+        let running = self.run.is_some();
+        self.stop(cx);
+        running
     }
 
     fn edit_target(&self) -> Result<&EditTarget, SharedString> {
         match &self.editability {
-            Some(Ok(target)) if self.result_sets.len() == 1 => Ok(target),
+            Some(Ok(target)) if self.result_sets.len() == 1 => {
+                let columns_match = self
+                    .result_sets
+                    .first()
+                    .is_some_and(|set| set.result.columns.len() == target.columns.len());
+                if columns_match {
+                    Ok(target)
+                } else {
+                    Err("Read-only: the result's columns don't match the statement's description."
+                        .into())
+                }
+            }
             Some(Err(reason)) => Err(format!("Read-only: {reason}").into()),
             _ => Err("Read-only: results can only be edited when a single statement returns one result set.".into()),
         }
@@ -365,10 +714,14 @@ impl QueryResultsView {
             return;
         }
 
-        let current = cell_value(set, row, column).flatten().unwrap_or_default();
-        let text = initial_text.unwrap_or(current);
+        let current = cell_value(set, row, column).flatten();
+        let keeps_value_unless_edited = current.is_none() && initial_text.is_none();
+        let text = initial_text.unwrap_or_else(|| current.unwrap_or_default());
         let editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
+            if keeps_value_unless_edited {
+                editor.set_placeholder_text(TableCell::NULL_TEXT, window, cx);
+            }
             editor.set_text(text.clone(), window, cx);
             editor.change_selections(SelectionEffects::default(), window, cx, |selections| {
                 selections
@@ -379,10 +732,14 @@ impl QueryResultsView {
         let subscription = cx.subscribe_in(
             &editor,
             window,
-            |this, _, event: &EditorEvent, window, cx| {
-                if matches!(event, EditorEvent::Blurred) {
-                    this.commit_edit(window, cx);
+            |this, _, event: &EditorEvent, window, cx| match event {
+                EditorEvent::Edited { .. } => {
+                    if let Some(edit) = this.editing.as_mut() {
+                        edit.edited = true;
+                    }
                 }
+                EditorEvent::Blurred => this.commit_edit(window, cx),
+                _ => {}
             },
         );
         set.table.update(cx, |table, cx| {
@@ -394,6 +751,8 @@ impl QueryResultsView {
             set_index,
             cell,
             editor,
+            keeps_value_unless_edited,
+            edited: false,
             _subscription: subscription,
         });
         cx.notify();
@@ -403,8 +762,10 @@ impl QueryResultsView {
         let Some(edit) = self.editing.take() else {
             return;
         };
-        let value = edit.editor.read(cx).text(cx);
-        self.set_cell(edit.set_index, edit.cell, Some(value), cx);
+        if !(edit.keeps_value_unless_edited && !edit.edited) {
+            let value = edit.editor.read(cx).text(cx);
+            self.set_cell(edit.set_index, edit.cell, Some(value), cx);
+        }
         self.finish_edit(&edit, window, cx);
     }
 
@@ -436,8 +797,8 @@ impl QueryResultsView {
         let row = cell.row.0;
         let column = cell.col.0;
         let original_rows = set.result.rows.len();
-        if row < original_rows {
-            let original = set.result.rows[row].get(column).cloned().flatten();
+        if let Some(values) = set.result.rows.get(row) {
+            let original = values.get(column).cloned().flatten();
             if original == value {
                 set.edits.updates.remove(&(row, column));
             } else {
@@ -531,8 +892,11 @@ impl QueryResultsView {
         self.cancel_edit(window, cx);
         self.notice = None;
         for index in 0..self.result_sets.len() {
-            let had_inserts = !self.result_sets[index].edits.inserts.is_empty();
-            self.result_sets[index].edits = PendingEdits::default();
+            let Some(set) = self.result_sets.get_mut(index) else {
+                continue;
+            };
+            let had_inserts = !set.edits.inserts.is_empty();
+            set.edits = PendingEdits::default();
             if had_inserts {
                 self.reload_table(index, cx);
             } else {
@@ -541,12 +905,13 @@ impl QueryResultsView {
         }
     }
 
-    /// Rebuilds the grid's rows, needed when new rows are added or dropped.
+    /// Rebuilds the grid's rows, needed when rows arrive or new rows are added or dropped.
     fn reload_table(&mut self, set_index: usize, cx: &mut Context<Self>) {
-        let Some(set) = self.result_sets.get(set_index) else {
+        let Some(set) = self.result_sets.get_mut(set_index) else {
             return;
         };
-        let content = table_content(&set.result, &set.edits);
+        set.grid_stale = false;
+        let content = table_content(set);
         set.table
             .update(cx, |table, cx| table.set_contents(content, cx));
         self.refresh_decorations(set_index, cx);
@@ -564,20 +929,6 @@ impl QueryResultsView {
         );
         let mut cells = HashMap::default();
         let mut rows = HashMap::default();
-        for (row_index, row) in set.result.rows.iter().enumerate() {
-            for (column, value) in row.iter().enumerate() {
-                if value.is_none() {
-                    cells.insert(
-                        DataCellId::new(DataRow(row_index), AnyColumn(column)),
-                        CellDecoration {
-                            text: None,
-                            background: None,
-                            muted: true,
-                        },
-                    );
-                }
-            }
-        }
         for ((row, column), value) in &set.edits.updates {
             cells.insert(
                 DataCellId::new(DataRow(*row), AnyColumn(*column)),
@@ -730,6 +1081,9 @@ impl QueryResultsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // An open result holds the session. Close it so the push can run; the query is run
+        // again afterwards anyway.
+        self.stop(cx);
         let count = statements.len();
         let task = DatabaseStore::global(cx).update(cx, |store, cx| {
             store.with_client(
@@ -744,23 +1098,29 @@ impl QueryResultsView {
             this.update_in(cx, |this, window, cx| {
                 this.push_task = None;
                 match result {
-                    Ok(_) => {
+                    Ok(applied) => {
                         for set in &mut this.result_sets {
                             set.edits = PendingEdits::default();
                         }
                         let sql = this.sql.clone();
                         this.run(sql, window, cx);
+                        let changes = if count == 1 { "change" } else { "changes" };
                         this.notice = Some(
-                            format!(
-                                "Pushed {count} {} in one transaction.",
-                                if count == 1 { "change" } else { "changes" }
-                            )
+                            if applied.in_open_transaction {
+                                format!(
+                                    "Pushed {count} {changes} into the console's open \
+                                     transaction. They're saved when it commits."
+                                )
+                            } else {
+                                format!("Pushed {count} {changes} in one transaction.")
+                            }
                             .into(),
                         );
                     }
                     Err(error) => {
                         this.notice = Some(format!("Push failed: {error:#}").into());
-                        this.messages.push(format!("Push failed: {error:#}").into());
+                        this.notes.push(format!("Push failed: {error:#}").into());
+                        this.rebuild_messages();
                     }
                 }
                 cx.notify();
@@ -789,54 +1149,119 @@ impl QueryResultsView {
         } else {
             self.target.database.clone()
         };
+        let summary = match self.active_tab {
+            Tab::Result(index) => self
+                .result_sets
+                .get(index)
+                .map(|set| self.rows_label(index, set.result.rows.len()))
+                .unwrap_or_default(),
+            Tab::Messages => String::new(),
+        };
+        let muted_label = |text: String| {
+            Label::new(text)
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .into_any_element()
+        };
         let status: AnyElement = match &self.state {
             RunState::Idle => div().into_any_element(),
-            RunState::Running(_) => h_flex()
+            RunState::Running | RunState::Stopping => h_flex()
                 .gap_1()
                 .child(SpinnerLabel::new())
-                .child(
-                    Label::new("Running…")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
+                .child(muted_label(match (&self.state, summary.is_empty()) {
+                    (RunState::Stopping, _) => "Stopping…".to_string(),
+                    (_, true) => "Running…".to_string(),
+                    (_, false) => format!("{summary} · fetching…"),
+                }))
                 .into_any_element(),
+            RunState::Paused => muted_label(summary),
             RunState::Failed => Label::new("Failed")
                 .size(LabelSize::Small)
                 .color(Color::Error)
                 .into_any_element(),
+            RunState::Stopped(reason) => h_flex()
+                .gap_1()
+                .when(!summary.is_empty(), |this| this.child(muted_label(summary)))
+                .child(
+                    Label::new(reason.clone())
+                        .size(LabelSize::Small)
+                        .color(Color::Warning),
+                )
+                .into_any_element(),
             RunState::Finished => {
-                let summary = match self.active_tab {
-                    Tab::Result(index) => self
-                        .result_sets
-                        .get(index)
-                        .map(|set| {
-                            let rows = set.result.rows.len();
-                            format!("{rows} {}", if rows == 1 { "row" } else { "rows" })
-                        })
-                        .unwrap_or_default(),
-                    Tab::Messages => String::new(),
-                };
                 let elapsed = self.elapsed.map(format_duration).unwrap_or_default();
-                Label::new(
+                muted_label(
                     [summary, elapsed]
                         .into_iter()
                         .filter(|part| !part.is_empty())
                         .collect::<Vec<_>>()
                         .join(" · "),
                 )
-                .size(LabelSize::Small)
-                .color(Color::Muted)
-                .into_any_element()
             }
         };
 
+        let run_controls = h_flex()
+            .gap_0p5()
+            .when(self.state == RunState::Paused, |this| {
+                let next_page = match self.fetch_limit {
+                    Some(limit) => format!("Next {limit}"),
+                    None => "Next Page".to_string(),
+                };
+                this.child(
+                    Button::new("database-fetch-next-page", next_page)
+                        .label_size(LabelSize::Small)
+                        .tooltip(Tooltip::for_action_title(
+                            "Fetch the next page of rows",
+                            &FetchNextPage,
+                        ))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.fetch(Fetch::NextPage, window, cx)
+                        })),
+                )
+                .child(
+                    Button::new("database-fetch-all", "All")
+                        .label_size(LabelSize::Small)
+                        .tooltip(Tooltip::for_action_title(
+                            "Fetch every remaining row",
+                            &FetchAllRows,
+                        ))
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.fetch(Fetch::All, window, cx)),
+                        ),
+                )
+            })
+            .when(
+                matches!(self.state, RunState::Running | RunState::Paused),
+                |this| {
+                    this.child(
+                        IconButton::new("database-stop", IconName::Stop)
+                            .icon_size(IconSize::Small)
+                            .icon_color(Color::Error)
+                            .tooltip(Tooltip::for_action_title(
+                                if self.state == RunState::Paused {
+                                    "Close the Open Result"
+                                } else {
+                                    "Stop the Statement"
+                                },
+                                &StopStatement,
+                            ))
+                            .on_click(cx.listener(|this, _, _, cx| this.stop(cx))),
+                    )
+                },
+            );
+
         let mut tabs = h_flex().gap_0p5();
-        for index in 0..self.result_sets.len() {
-            let rows = self.result_sets[index].result.rows.len();
+        for (index, set) in self.result_sets.iter().enumerate() {
+            let rows = set.result.rows.len();
+            let count = if self.has_more_rows(index) {
+                format!("{rows}+")
+            } else {
+                rows.to_string()
+            };
             tabs = tabs.child(
                 Button::new(
                     ("database-result-tab", index),
-                    format!("Result {} ({rows})", index + 1),
+                    format!("Result {} ({count})", index + 1),
                 )
                 .label_size(LabelSize::Small)
                 .toggle_state(self.active_tab == Tab::Result(index))
@@ -880,16 +1305,33 @@ impl QueryResultsView {
                             .size(LabelSize::Small)
                             .truncate(),
                     )
-                    .child(status),
+                    .child(status)
+                    .child(run_controls),
             )
             .child(tabs)
+    }
+
+    /// Whether result set `index` stopped at the fetch limit with rows left on the server.
+    fn has_more_rows(&self, index: usize) -> bool {
+        self.state == RunState::Paused && index + 1 == self.result_sets.len()
+    }
+
+    fn rows_label(&self, index: usize, rows: usize) -> String {
+        if self.has_more_rows(index) {
+            format!("{} · more available", row_count_text(rows))
+        } else {
+            row_count_text(rows)
+        }
     }
 
     fn render_edit_toolbar(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
         let Tab::Result(_) = self.active_tab else {
             return None;
         };
-        if !matches!(self.state, RunState::Finished) {
+        if !matches!(
+            self.state,
+            RunState::Finished | RunState::Paused | RunState::Stopped(_)
+        ) {
             return None;
         }
         let target = self.edit_target();
@@ -1042,37 +1484,49 @@ fn cell_value(set: &ResultSetView, row: usize, column: usize) -> Option<Option<S
     }
 }
 
-fn display_text(value: Option<&str>) -> SharedString {
-    value.unwrap_or(NULL_TEXT).to_string().into()
+fn row_count_text(rows: usize) -> String {
+    format!("{rows} {}", if rows == 1 { "row" } else { "rows" })
 }
 
-fn table_content(result: &ResultSet, edits: &PendingEdits) -> TableLikeContent {
-    let columns = result.columns.len();
-    let cell = |value: &Option<String>| TableCell::Generated(display_text(value.as_deref()));
-    let new_rows = edits.inserts.iter().map(|values| {
-        values
-            .iter()
-            .map(|value| match value {
+fn display_text(value: Option<&str>) -> SharedString {
+    value.unwrap_or(TableCell::NULL_TEXT).to_string().into()
+}
+
+fn value_cell(value: &Option<String>) -> TableCell {
+    match value {
+        Some(text) => TableCell::Generated(text.clone().into()),
+        None => TableCell::Null,
+    }
+}
+
+fn table_row(cells: impl Iterator<Item = TableCell>, columns: usize) -> TableRow<TableCell> {
+    let mut cells = cells.collect::<Vec<_>>();
+    cells.truncate(columns);
+    cells.resize_with(columns, || TableCell::Virtual);
+    TableRow::from_vec(cells, columns)
+}
+
+fn table_content(set: &ResultSetView) -> TableLikeContent {
+    let columns = set.result.columns.len();
+    let new_rows = set.edits.inserts.iter().map(|values| {
+        table_row(
+            values.iter().map(|value| match value {
                 None => TableCell::Generated(DEFAULT_TEXT.into()),
-                Some(value) => cell(value),
-            })
-            .collect::<Vec<_>>()
+                Some(value) => value_cell(value),
+            }),
+            columns,
+        )
     });
-    let rows = result
-        .rows
+    let rows = set
+        .cells
         .iter()
-        .map(|row| row.iter().map(cell).collect::<Vec<_>>())
+        .cloned()
         .chain(new_rows)
-        .map(|mut cells| {
-            cells.truncate(columns);
-            cells.resize_with(columns, || TableCell::Virtual);
-            TableRow::from_vec(cells, columns)
-        })
         .collect::<Vec<_>>();
     TableLikeContent {
         number_of_cols: columns,
         headers: TableRow::from_vec(
-            result
+            set.result
                 .columns
                 .iter()
                 .map(|column| TableCell::Generated(column.name.clone().into()))
@@ -1104,6 +1558,15 @@ impl Render for QueryResultsView {
         v_flex()
             .key_context("DatabaseResults")
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|this, _: &StopStatement, _, cx| this.stop(cx)))
+            .on_action(cx.listener(|this, _: &FetchNextPage, window, cx| {
+                this.fetch(Fetch::NextPage, window, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &FetchAllRows, window, cx| {
+                    this.fetch(Fetch::All, window, cx)
+                }),
+            )
             .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
                 if this.editing.is_some() {
                     this.commit_edit(window, cx);
@@ -1212,18 +1675,49 @@ impl QueryResultsView {
     pub(crate) fn review_push_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.review_push(window, cx);
     }
-}
 
-#[cfg(test)]
-impl QueryResultsView {
     pub(crate) fn messages_for_test(&self) -> Vec<String> {
         self.messages.iter().map(ToString::to_string).collect()
     }
-}
 
-#[cfg(test)]
-impl QueryResultsView {
     pub(crate) fn is_busy_for_test(&self) -> bool {
-        self.push_task.is_some() || matches!(self.state, RunState::Running(_))
+        self.push_task.is_some() || self.state.is_active()
+    }
+
+    pub(crate) fn is_paused_for_test(&self) -> bool {
+        self.state == RunState::Paused
+    }
+
+    pub(crate) fn stopped_reason_for_test(&self) -> Option<String> {
+        match &self.state {
+            RunState::Stopped(reason) => Some(reason.to_string()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn fetch_for_test(
+        &mut self,
+        all: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.fetch(if all { Fetch::All } else { Fetch::NextPage }, window, cx);
+    }
+
+    pub(crate) fn grid_cell_for_test(
+        &self,
+        set_index: usize,
+        row: usize,
+        column: usize,
+        cx: &App,
+    ) -> Option<TableCell> {
+        let set = self.result_sets.get(set_index)?;
+        let table = set.table.read(cx);
+        table
+            .contents()
+            .rows
+            .get(row)?
+            .get(AnyColumn(column))
+            .cloned()
     }
 }

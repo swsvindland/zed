@@ -22,11 +22,17 @@ pub enum TableCell {
     },
     /// Display text without a source span, used for generated column headings.
     Generated(SharedString),
+    /// A missing value (SQL `NULL`), drawn as [`TableCell::NULL_TEXT`] so it differs from an
+    /// empty string.
+    Null,
     /// Virtual cell, created to pad malformed row
     Virtual,
 }
 
 impl TableCell {
+    /// How a [`TableCell::Null`] cell is drawn; filter menus use the same text.
+    pub const NULL_TEXT: &str = "<null>";
+
     /// Create a TableCell with buffer position tracking
     pub fn from_buffer_position(
         content: SharedString,
@@ -46,12 +52,13 @@ impl TableCell {
         }
     }
 
-    /// Get the display value for this cell
+    /// Get the display value for this cell. `None` for null and virtual cells, which filters
+    /// therefore group under `<null>` rather than with empty strings.
     pub fn display_value(&self) -> Option<&SharedString> {
         match self {
             TableCell::Real { cached_value, .. } => Some(cached_value),
             TableCell::Generated(value) => Some(value),
-            TableCell::Virtual => None,
+            TableCell::Null | TableCell::Virtual => None,
         }
     }
 }

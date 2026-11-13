@@ -1,14 +1,26 @@
+use std::{pin::pin, time::Duration};
+
 use anyhow::{Context as _, Result};
+use futures::{Stream, StreamExt as _, future};
+use postgres_native_tls::MakeTlsConnector;
 use tokio_postgres::{SimpleQueryMessage, config::SslMode, types::ToSql};
 
 use crate::{
-    ColumnInfo, ColumnSummary, ConnectionProfile, DatabaseObject, EditTarget, Editability,
-    ObjectKind, ResultSet, StatementOutcome, check_affected,
+    Applied, ColumnInfo, ColumnSummary, ConnectionProfile, DatabaseObject, EditTarget, Editability,
+    ObjectKind, SessionReset,
+    catalog::{Catalog, ObjectName},
+    check_affected,
+    execution::{Execution, ExecutionEnd, Item, ReadEnd},
     sql::{EditColumn, ParameterizedStatement, TableRef},
 };
 
+/// How long the rest of a cancelled statement may take to arrive.
+const CANCEL_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct PostgresClient {
     client: tokio_postgres::Client,
+    /// Kept for cancel requests, which open their own connection.
+    tls: MakeTlsConnector,
 }
 
 impl PostgresClient {
@@ -37,8 +49,9 @@ impl PostgresClient {
         let connector = native_tls::TlsConnector::builder()
             .danger_accept_invalid_certs(profile.trust_server_certificate)
             .build()?;
+        let tls = MakeTlsConnector::new(connector);
         let (client, connection) = config
-            .connect(postgres_native_tls::MakeTlsConnector::new(connector))
+            .connect(tls.clone())
             .await
             .with_context(|| format!("connecting to {}", profile.host))?;
         tokio::spawn(async move {
@@ -46,59 +59,52 @@ impl PostgresClient {
                 log::error!("postgres connection closed: {error}");
             }
         });
-        Ok(Self { client })
+        Ok(Self { client, tls })
     }
 
-    pub async fn run(&mut self, sql: &str) -> Result<Vec<StatementOutcome>> {
-        let messages = self.client.simple_query(sql).await?;
-        let mut outcomes = Vec::new();
-        let mut current: Option<ResultSet> = None;
-        for message in messages {
-            match message {
-                SimpleQueryMessage::RowDescription(columns) => {
-                    current = Some(ResultSet {
-                        columns: columns
-                            .iter()
-                            .map(|column| ColumnInfo {
-                                name: column.name().to_string(),
-                                type_name: String::new(),
-                            })
-                            .collect(),
-                        rows: Vec::new(),
-                    });
+    pub async fn execute(&mut self, sql: &str, execution: &mut Execution) -> Result<ExecutionEnd> {
+        let stream = match execution.guard(self.client.simple_query_raw(sql)).await {
+            Ok(stream) => stream?,
+            Err(interrupt) => return Ok(interrupt.into()),
+        };
+        let mut items = pin!(items(stream));
+        let interrupt = match execution.read(&mut items).await? {
+            ReadEnd::Exhausted => return Ok(ExecutionEnd::Completed),
+            ReadEnd::Interrupted(interrupt) => interrupt,
+        };
+        // The cancel goes over a connection of its own, so this session keeps its place in the
+        // protocol; reading on to the end leaves it ready for the next statement.
+        if let Err(error) = self
+            .client
+            .cancel_token()
+            .cancel_query(self.tls.clone())
+            .await
+        {
+            log::warn!("couldn't send a cancel request: {error}");
+        }
+        // The deadline is checked between rows as well, since a timeout only fires while its
+        // future waits and rows that are already buffered arrive without waiting.
+        let deadline = tokio::time::Instant::now() + CANCEL_TIMEOUT;
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout_at(deadline, items.next()).await {
+                Ok(None) => return Ok(interrupt.into()),
+                Ok(Some(Err(error)))
+                    if error
+                        .downcast_ref::<tokio_postgres::Error>()
+                        .is_some_and(tokio_postgres::Error::is_closed) =>
+                {
+                    return Err(SessionReset(format!("{error:#}")).into());
                 }
-                SimpleQueryMessage::Row(row) => {
-                    let result = current.get_or_insert_with(|| ResultSet {
-                        columns: row
-                            .columns()
-                            .iter()
-                            .map(|column| ColumnInfo {
-                                name: column.name().to_string(),
-                                type_name: String::new(),
-                            })
-                            .collect(),
-                        rows: Vec::new(),
-                    });
-                    result.rows.push(
-                        (0..row.len())
-                            .map(|index| row.get(index).map(ToOwned::to_owned))
-                            .collect(),
-                    );
-                }
-                SimpleQueryMessage::CommandComplete(count) => match current.take() {
-                    Some(result) => outcomes.push(StatementOutcome::Rows(result)),
-                    None => outcomes.push(StatementOutcome::RowsAffected(count)),
-                },
-                _ => {}
+                // Rows still in flight, and the `query_canceled` error that ends the statement.
+                Ok(Some(_)) => {}
+                Err(_) => break,
             }
         }
-        if let Some(result) = current.take() {
-            outcomes.push(StatementOutcome::Rows(result));
-        }
-        if outcomes.is_empty() {
-            outcomes.push(StatementOutcome::Completed);
-        }
-        Ok(outcomes)
+        Err(SessionReset(format!(
+            "PostgreSQL didn't stop the statement within {} s",
+            CANCEL_TIMEOUT.as_secs()
+        ))
+        .into())
     }
 
     async fn strings(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<String>> {
@@ -177,17 +183,98 @@ impl PostgresClient {
             .collect()
     }
 
-    pub async fn editability(&mut self, sql: &str, result: &ResultSet) -> Result<Editability> {
+    pub async fn catalog(&mut self) -> Result<Catalog> {
+        let default_schema = self
+            .client
+            .query_one("SELECT current_schema()::text", &[])
+            .await?
+            .try_get::<_, Option<String>>(0)?;
+        let schemas = self.list_schemas().await?;
+        let column_rows = self
+            .client
+            .query(
+                "SELECT n.nspname::text, c.relname::text, c.relkind::text, a.attname::text, \
+                   format_type(a.atttypid, a.atttypmod), NOT a.attnotnull, \
+                   COALESCE(a.attnum = ANY(i.indkey), false) \
+                 FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped \
+                 LEFT JOIN pg_index i ON i.indrelid = c.oid AND i.indisprimary \
+                 WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') \
+                   AND n.nspname NOT LIKE 'pg\\_%' AND n.nspname <> 'information_schema' \
+                 ORDER BY n.nspname, c.relname, a.attnum",
+                &[],
+            )
+            .await?;
+        let mut objects = Vec::with_capacity(column_rows.len());
+        for row in &column_rows {
+            let kind: String = row.try_get(2)?;
+            objects.push((
+                ObjectName {
+                    schema: row.try_get(0)?,
+                    name: row.try_get(1)?,
+                },
+                if kind == "v" || kind == "m" {
+                    ObjectKind::View
+                } else {
+                    ObjectKind::Table
+                },
+                ColumnSummary {
+                    name: row.try_get(3)?,
+                    type_name: row.try_get(4)?,
+                    nullable: row.try_get(5)?,
+                    primary_key: row.try_get(6)?,
+                },
+            ));
+        }
+        let key_rows = self
+            .client
+            .query(
+                "SELECT con.conname::text, pn.nspname::text, pc.relname::text, pa.attname::text, \
+                   rn.nspname::text, rc.relname::text, ra.attname::text \
+                 FROM pg_constraint con \
+                 JOIN pg_class pc ON pc.oid = con.conrelid \
+                 JOIN pg_namespace pn ON pn.oid = pc.relnamespace \
+                 JOIN pg_class rc ON rc.oid = con.confrelid \
+                 JOIN pg_namespace rn ON rn.oid = rc.relnamespace \
+                 CROSS JOIN LATERAL unnest(con.conkey, con.confkey) WITH ORDINALITY AS k(attnum, refattnum, ordinal) \
+                 JOIN pg_attribute pa ON pa.attrelid = con.conrelid AND pa.attnum = k.attnum \
+                 JOIN pg_attribute ra ON ra.attrelid = con.confrelid AND ra.attnum = k.refattnum \
+                 WHERE con.contype = 'f' \
+                 ORDER BY con.oid, k.ordinal",
+                &[],
+            )
+            .await?;
+        let mut keys = Vec::with_capacity(key_rows.len());
+        for row in &key_rows {
+            keys.push((
+                row.try_get(0)?,
+                ObjectName {
+                    schema: row.try_get(1)?,
+                    name: row.try_get(2)?,
+                },
+                row.try_get(3)?,
+                ObjectName {
+                    schema: row.try_get(4)?,
+                    name: row.try_get(5)?,
+                },
+                row.try_get(6)?,
+            ));
+        }
+        Ok(Catalog {
+            default_schema,
+            schemas,
+            objects: crate::catalog::group_columns(objects),
+            foreign_keys: crate::catalog::group_foreign_keys(keys),
+        })
+    }
+
+    pub async fn editability(&mut self, sql: &str) -> Result<Editability> {
         let statement = match self.client.prepare(sql).await {
             Ok(statement) => statement,
             Err(error) => return Ok(Err(format!("Couldn't describe the query: {error}"))),
         };
         let columns = statement.columns();
-        if columns.len() != result.columns.len() {
-            return Ok(Err(
-                "The result's columns don't match the statement's description.".into(),
-            ));
-        }
         let mut table_oids = columns
             .iter()
             .filter_map(|column| column.table_oid())
@@ -309,7 +396,9 @@ impl PostgresClient {
         }))
     }
 
-    pub async fn apply(&mut self, statements: &[ParameterizedStatement]) -> Result<Vec<u64>> {
+    /// Note that `transaction` sends `BEGIN` and `COMMIT` even when the console left a
+    /// transaction block open, which commits (or, on failure, aborts) that block too.
+    pub async fn apply(&mut self, statements: &[ParameterizedStatement]) -> Result<Applied> {
         let transaction = self.client.transaction().await?;
         let mut counts = Vec::with_capacity(statements.len());
         for statement in statements {
@@ -326,6 +415,44 @@ impl PostgresClient {
             counts.push(affected);
         }
         transaction.commit().await?;
-        Ok(counts)
+        Ok(Applied {
+            counts,
+            in_open_transaction: false,
+        })
     }
+}
+
+/// Maps the simple query protocol onto driver items. A command without a row description
+/// (an `UPDATE`, say) reports its row count instead.
+fn items(stream: tokio_postgres::SimpleQueryStream) -> impl Stream<Item = Result<Item>> {
+    stream
+        .scan(false, |in_result_set, message| {
+            let item = match message {
+                Err(error) => Some(Err(error.into())),
+                Ok(SimpleQueryMessage::RowDescription(columns)) => {
+                    *in_result_set = true;
+                    Some(Ok(Item::Columns(
+                        columns
+                            .iter()
+                            .map(|column| ColumnInfo {
+                                name: column.name().to_string(),
+                                type_name: String::new(),
+                            })
+                            .collect(),
+                    )))
+                }
+                Ok(SimpleQueryMessage::Row(row)) => Some(Ok(Item::Row(
+                    (0..row.len())
+                        .map(|index| row.get(index).map(ToOwned::to_owned))
+                        .collect(),
+                ))),
+                Ok(SimpleQueryMessage::CommandComplete(count)) => {
+                    let had_rows = std::mem::replace(in_result_set, false);
+                    (!had_rows).then_some(Ok(Item::RowsAffected(count)))
+                }
+                Ok(_) => None,
+            };
+            future::ready(Some(item))
+        })
+        .filter_map(future::ready)
 }

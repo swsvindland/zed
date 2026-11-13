@@ -31,6 +31,8 @@ pub struct ConnectionModal {
     password: Entity<InputField>,
     databases: Entity<InputField>,
     default_database: Entity<InputField>,
+    fetch_limit: Entity<InputField>,
+    query_timeout: Entity<InputField>,
     status: Status,
     task: Option<Task<()>>,
     focus_handle: FocusHandle,
@@ -126,6 +128,26 @@ impl ConnectionModal {
             window,
             cx,
         );
+        let fetch_limit = field(
+            "Fetch limit",
+            &format!("{} rows; 0 fetches all", database::DEFAULT_FETCH_LIMIT),
+            &profile
+                .fetch_limit
+                .map(|limit| limit.to_string())
+                .unwrap_or_default(),
+            window,
+            cx,
+        );
+        let query_timeout = field(
+            "Query timeout (seconds)",
+            "None",
+            &profile
+                .query_timeout_seconds
+                .map(|seconds| seconds.to_string())
+                .unwrap_or_default(),
+            window,
+            cx,
+        );
         Self {
             profile,
             is_existing,
@@ -137,6 +159,8 @@ impl ConnectionModal {
             password,
             databases,
             default_database,
+            fetch_limit,
+            query_timeout,
             status: Status::Idle,
             task: None,
             focus_handle: cx.focus_handle(),
@@ -176,6 +200,24 @@ impl ConnectionModal {
             .collect();
         let default_database = text(&self.default_database);
         profile.default_database = (!default_database.is_empty()).then_some(default_database);
+        let fetch_limit = text(&self.fetch_limit);
+        profile.fetch_limit = if fetch_limit.is_empty() {
+            None
+        } else {
+            Some(fetch_limit.parse().map_err(|_| {
+                format!("\"{fetch_limit}\" isn't a row count. Use 0 to fetch every row.")
+            })?)
+        };
+        let query_timeout = text(&self.query_timeout);
+        profile.query_timeout_seconds = if query_timeout.is_empty() {
+            None
+        } else {
+            Some(
+                query_timeout
+                    .parse()
+                    .map_err(|_| format!("\"{query_timeout}\" isn't a number of seconds."))?,
+            )
+        };
         let password = self.password.read(cx).text(cx);
         let password = (profile.needs_password() && !password.is_empty()).then_some(password);
         Ok((profile, password))
@@ -405,6 +447,12 @@ impl Render for ConnectionModal {
                     .gap_2()
                     .child(self.databases.clone())
                     .child(self.default_database.clone()),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(self.fetch_limit.clone())
+                    .child(self.query_timeout.clone()),
             )
             .child(
                 h_flex()

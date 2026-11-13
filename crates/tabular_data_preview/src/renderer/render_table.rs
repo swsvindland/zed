@@ -123,14 +123,21 @@ impl TableView {
             let decoration = this.cell_decorations.get(&data_cell_id);
             let row_decoration = this.row_decorations.get(&data_row);
 
-            // TODO: Introduce `<null>` cell type
-            let cell_content = decoration
-                .and_then(|decoration| decoration.text.clone())
+            let decoration_text = decoration.and_then(|decoration| decoration.text.clone());
+            let is_null = decoration_text.is_none() && matches!(table_cell, TableCell::Null);
+            let cell_content = decoration_text
                 .or_else(|| table_cell.display_value().cloned())
-                .unwrap_or_default();
-            let is_muted = decoration
-                .or(row_decoration)
-                .is_some_and(|decoration| decoration.muted);
+                .unwrap_or_else(|| {
+                    if is_null {
+                        TableCell::NULL_TEXT.into()
+                    } else {
+                        SharedString::default()
+                    }
+                });
+            let is_muted = is_null
+                || decoration
+                    .or(row_decoration)
+                    .is_some_and(|decoration| decoration.muted);
             let decoration_bg = decoration
                 .and_then(|decoration| decoration.background)
                 .or_else(|| row_decoration.and_then(|decoration| decoration.background));
@@ -217,6 +224,7 @@ impl TableView {
                                 }
                                 TableCell::Virtual => "Virtual cell".into(),
                                 TableCell::Generated(_) => "Generated cell".into(),
+                                TableCell::Null => "Null cell".into(),
                             },
                         ))
                     })

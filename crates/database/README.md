@@ -21,9 +21,60 @@ It has no UI; drivers are async and run on the Tokio runtime from `gpui_tokio`.
   `encrypt` is off).
 - **`Client`** runs scripts (multiple result sets, affected-row counts), lists databases /
   schemas / tables / views / columns, decides whether a result is editable
-  (`editability`: one statement, one table, primary key present in the result) and applies
-  edits in a single transaction (`apply`), rolling back if an update or delete doesn't hit
-  exactly one row.
+  (`editability`: one statement, one table, primary key present in the result; it describes
+  the statement without running it) and applies edits in a single transaction (`apply`),
+  rolling back if an update or delete doesn't hit exactly one row. On SQL Server, when the
+  session already has a transaction open (a console's `BEGIN TRANSACTION`), `apply` takes a
+  savepoint instead: a failed push rolls back only to it, a successful one is committed with
+  that transaction (`Applied::in_open_transaction`), and an error that ended or doomed the
+  transaction says so. On PostgreSQL `apply` still sends its own `BEGIN` and `COMMIT`, which
+  commits or aborts an open transaction block; it's unchanged because there's no live
+  PostgreSQL test to check a fix against. Values come back as text,
+  with `None` for SQL `NULL`.
+- **Running statements** (`execution`, `Client::execute`): rows are sent as
+  `ExecutionEvent`s while they arrive, and each result set pauses at the profile's
+  `fetch_limit` (default `DEFAULT_FETCH_LIMIT`, 500; `0` reads everything) with the server's
+  result left open. The `ExecutionHandle` asks for the next page, for everything, or cancels;
+  dropping it cancels too. While a result is open its session is busy.
+  - On SQL Server every run is sent as a SQL batch, so temp tables, `USE`, `SET` options and
+    transactions stay with the session between runs. (Tiberius's `Client::execute` goes
+    through `sp_executesql`, which scopes all of those to the call; `BEGIN TRANSACTION` alone
+    fails there with error 266.) Tiberius 0.13 drops the `DONE` tokens that carry a batch's
+    per-statement row counts, so the count is read back afterwards with
+    `SELECT ROWCOUNT_BIG()` in a batch of its own. That only knows the last statement's count,
+    so a count is reported when a run's last statement is its only data change (`INSERT`,
+    `UPDATE`, `DELETE` or `MERGE`, also after `WITH`), including under `SET NOCOUNT ON`.
+    Other runs report completion without a count, and `@@ROWCOUNT` in the next run reads the
+    probe's 1. A tiberius change that kept the `DONE` counts on `QueryStream` would give every
+    statement its own count.
+  - `query_timeout_seconds` cancels a statement whose server work runs longer. Time spent
+    paused at the fetch limit doesn't count.
+  - Cancelling on SQL Server reads a small remainder to the end if it's already on the wire,
+    and otherwise sends a TDS Attention. SQL Server acknowledges an Attention in a message of
+    its own after the cancelled response, which tiberius 0.13 doesn't read, so on unencrypted
+    sessions (LocalDB, named pipes, `encrypt: false`) a filter under tiberius drops that
+    acknowledgement and the session stays usable. Below TLS the filter can't see packets, so a
+    cancelled statement on an encrypted connection closes the session instead
+    (`SessionReset`) and the pool reconnects.
+  - Cancelling on PostgreSQL sends a `CancelToken` request over its own connection and reads
+    the statement to its end, keeping the session.
+  - Tiberius's own `command_timeout` is turned off: when it fires it leaves the session out of
+    sync with the server.
+  - `Client::run` is the uninterruptible form, collecting everything.
+- **Completion** (`catalog`, `completion`): `Client::catalog` reads a database's schemas,
+  tables and views with their columns and types, and foreign keys, in a few bulk queries.
+  `completion::complete` works out what the cursor is in and offers candidates:
+  - tables, views and schemas after `FROM`, `JOIN`, `UPDATE`, `INTO` or a comma in a `FROM`
+    list;
+  - a table's columns after `alias.`, `table.` or `schema.table.`, and a schema's objects after
+    `schema.`;
+  - after `JOIN`, whole joins from foreign keys (`Customers c ON c.Id = o.CustomerId`), and
+    after `ON`, the conditions alone;
+  - elsewhere, the columns of every table in the statement (qualified when ambiguous), its
+    aliases and keywords.
+
+  Names are quoted where the dialect needs it, including mixed-case names on PostgreSQL.
+  `completion::may_change_schema` spots DDL, so callers know to read the catalog again.
 - **`ConnectionPool`** keeps one session per connection, database and session name.
 - **`sql`** splits scripts into statements (`;`, blank lines, `GO`, aware of strings, comments,
   brackets, `BEGIN … END` and dollar quotes), and generates parameterized
@@ -32,9 +83,12 @@ It has no UI; drivers are async and run on the Tokio runtime from `gpui_tokio`.
 
 ## Tests
 
-`cargo test -p database` runs the unit tests. To also run the end-to-end test against a real
-SQL Server (it creates a `ZedDatabaseTest` database), point it at a server reachable with
-integrated authentication:
+`cargo test -p database` runs the unit tests, which include paging, cancelling and timeouts
+against simulated result streams, and completion (alias resolution, join conditions, quoting).
+To also run the end-to-end tests against a real SQL Server, point them at a server reachable
+with integrated authentication. They create a `ZedDatabaseTest` database and check cancelling
+on the server (including the session surviving it), paging and timeouts, and that temp tables,
+`USE`, `SET` options and open transactions carry over between runs with row counts reported.
 
 ```sh
 ZED_DATABASE_TEST_SQL_SERVER='(localdb)\MSSQLLocalDB' cargo test -p database --test local_db
