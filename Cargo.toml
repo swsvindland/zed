@@ -1081,6 +1081,9 @@ crash-context = { git = "https://github.com/rust-minidump/minidump-writer", rev 
 # per-crate scratch dirs are sufficient. Upstream issue:
 # https://github.com/dtolnay/cxx/issues/1752
 scratch = { path = "tooling/corgi/patches/scratch" }
+# tiberius 0.13.0 with `cancel_query` reading the Attention acknowledgement that
+# SQL Server sends as a message of its own. See tooling/patches/tiberius/PATCHES.md.
+tiberius = { path = "tooling/patches/tiberius" }
 
 [profile.dev]
 split-debuginfo = "unpacked"
