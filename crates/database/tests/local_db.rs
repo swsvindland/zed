@@ -4,7 +4,7 @@
 use std::time::{Duration, Instant};
 
 use database::{
-    Authentication, Client, ConnectionProfile, DriverKind, ExecutionEnd, ExecutionEvent,
+    Applied, Authentication, Client, ConnectionProfile, DriverKind, ExecutionEnd, ExecutionEvent,
     ExecutionHandle, ExecutionOptions, Fetch, StatementOutcome, execution,
     sql::{self, RowChange},
 };
@@ -259,8 +259,13 @@ async fn sql_server_round_trip() -> anyhow::Result<()> {
             },
         ],
     )?;
-    let counts = client.apply(&statements).await?;
-    assert_eq!(counts, vec![1, 1, 1]);
+    assert_eq!(
+        client.apply(&statements).await?,
+        Applied {
+            counts: vec![1, 1, 1],
+            in_open_transaction: false,
+        }
+    );
 
     let after = client.run(query).await?;
     let StatementOutcome::Rows(after) = &after.outcomes[0] else {
@@ -444,6 +449,87 @@ async fn sql_server_session_state_carries_over_between_runs() -> anyhow::Result<
         .editability("SELECT Id, Body FROM dbo.SessionNotes")
         .await?;
     assert!(target.is_ok(), "{target:?}");
+
+    Ok(())
+}
+
+/// A push into a transaction the console left open stays inside it: a failed push undoes only
+/// its own changes, and a successful one is kept or dropped with the console's transaction.
+#[tokio::test(flavor = "multi_thread")]
+async fn sql_server_push_inside_an_open_transaction() -> anyhow::Result<()> {
+    let Some(profile) = profile() else {
+        eprintln!("ZED_DATABASE_TEST_SQL_SERVER not set; skipping");
+        return Ok(());
+    };
+    let value = |text: &str| Some(text.to_string());
+    const STATE: &str = "SELECT CONCAT(@@TRANCOUNT, ' ', \
+         (SELECT Body FROM dbo.PushNotes WHERE Id = 1), ' ', \
+         (SELECT Body FROM dbo.PushNotes WHERE Id = 2))";
+
+    let mut client = Client::connect(&profile, Some("tempdb"), None).await?;
+    client
+        .run(
+            "DROP TABLE IF EXISTS dbo.PushNotes;\n\
+             CREATE TABLE dbo.PushNotes (Id int PRIMARY KEY, Body nvarchar(20) NULL);\n\
+             INSERT INTO dbo.PushNotes VALUES (1, N'one'), (2, N'two')",
+        )
+        .await?;
+    let target = client
+        .editability("SELECT Id, Body FROM dbo.PushNotes")
+        .await?
+        .map_err(anyhow::Error::msg)?;
+    let update = |id: &str, body: &str| RowChange::Update {
+        key: vec![(0, Some(id.into()))],
+        values: vec![(1, Some(body.into()))],
+    };
+    let push = |changes: &[RowChange]| {
+        sql::generate_statements(
+            sql::Dialect::SqlServer,
+            &target.table,
+            &target.columns,
+            changes,
+        )
+    };
+
+    client.run("BEGIN TRANSACTION").await?;
+    client
+        .run("UPDATE dbo.PushNotes SET Body = N'console' WHERE Id = 2")
+        .await?;
+
+    // A stale key fails the push, which keeps the console's change and transaction.
+    let stale = push(&[update("1", "pushed"), update("99", "ghost")])?;
+    assert!(client.apply(&stale).await.is_err());
+    assert_eq!(scalar(&mut client, STATE).await?, value("1 one console"));
+
+    // A push that works isn't committed on its own...
+    assert_eq!(
+        client.apply(&push(&[update("1", "pushed")])?).await?,
+        Applied {
+            counts: vec![1],
+            in_open_transaction: true,
+        }
+    );
+    assert_eq!(scalar(&mut client, STATE).await?, value("1 pushed console"));
+    // ...so rolling the console's transaction back drops it too.
+    client.run("ROLLBACK").await?;
+    assert_eq!(scalar(&mut client, STATE).await?, value("0 one two"));
+
+    // Under `XACT_ABORT`, a failing statement ends the console's transaction, and the error
+    // says so.
+    client.run("SET XACT_ABORT ON").await?;
+    client.run("BEGIN TRANSACTION").await?;
+    let duplicate = push(&[RowChange::Insert {
+        values: vec![(0, Some("1".into())), (1, Some("again".into()))],
+    }])?;
+    let error = client
+        .apply(&duplicate)
+        .await
+        .expect_err("a duplicate key fails the push");
+    assert!(
+        format!("{error:#}").contains("open transaction was rolled back too"),
+        "{error:#}"
+    );
+    assert_eq!(scalar(&mut client, STATE).await?, value("0 one two"));
 
     Ok(())
 }

@@ -77,7 +77,10 @@ the grid is editable:
   pending changes.
 - **Push** shows the generated `UPDATE … WHERE <key>`, `INSERT` and `DELETE` statements with
   their bound parameter values, then runs them in one transaction and re-runs the query.
-  Production connections get a red header and need an explicit acknowledgement before pushing.
+  On SQL Server, a push into a transaction left open in the console joins it: a failed push
+  undoes only its own changes, and nothing is saved until the console commits, which the
+  notice after the push points out. (PostgreSQL still commits the open transaction; see the
+  `database` README.) Production connections get a red header and need an explicit acknowledgement before pushing.
 
 When a result can't be edited (joins, several statements, no primary key, key not selected,
 views without a single base table), the grid says why. Identity and computed columns are

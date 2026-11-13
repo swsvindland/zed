@@ -15,8 +15,8 @@ use tiberius::{
 use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
 
 use crate::{
-    Authentication, ColumnInfo, ColumnSummary, ConnectionProfile, DatabaseObject, EditTarget,
-    Editability, ObjectKind, SessionReset,
+    Applied, Authentication, ColumnInfo, ColumnSummary, ConnectionProfile, DatabaseObject,
+    EditTarget, Editability, ObjectKind, SessionReset,
     catalog::{Catalog, ObjectName},
     check_affected,
     execution::{Execution, ExecutionEnd, ExecutionEvent, Item, ReadEnd, Settled, settle},
@@ -630,35 +630,74 @@ impl SqlServerClient {
         }))
     }
 
-    pub async fn apply(&mut self, statements: &[ParameterizedStatement]) -> Result<Vec<u64>> {
-        self.client
-            .simple_query("BEGIN TRANSACTION")
-            .await?
-            .into_results()
-            .await?;
-        let result = self.apply_in_transaction(statements).await;
-        match &result {
-            Ok(_) => {
-                self.client
-                    .simple_query("COMMIT TRANSACTION")
-                    .await?
-                    .into_results()
-                    .await?;
-            }
-            Err(_) => {
-                let rollback = self
-                    .client
-                    .simple_query("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION")
-                    .await;
-                match rollback {
-                    Ok(stream) => {
-                        stream.into_results().await.log_rollback_error();
-                    }
-                    Err(error) => log::error!("rollback failed: {error}"),
+    pub async fn apply(&mut self, statements: &[ParameterizedStatement]) -> Result<Applied> {
+        // The console may have left a transaction open on this session. Another `BEGIN` and
+        // `COMMIT` would only nest inside it, and a rollback would undo the console's own work
+        // too, so the push takes a savepoint instead and leaves the commit to that transaction.
+        let in_open_transaction = self.transaction_state().await?.count > 0;
+        let (begin, rollback) = if in_open_transaction {
+            (
+                "SAVE TRANSACTION zed_push",
+                // A doomed transaction can't go back to a savepoint; only its owner can end it.
+                "IF XACT_STATE() = 1 ROLLBACK TRANSACTION zed_push",
+            )
+        } else {
+            (
+                "BEGIN TRANSACTION",
+                "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION",
+            )
+        };
+        self.run_batch(begin).await?;
+        let error = match self.apply_in_transaction(statements).await {
+            Ok(counts) => {
+                if !in_open_transaction {
+                    self.run_batch("COMMIT TRANSACTION").await?;
                 }
+                return Ok(Applied {
+                    counts,
+                    in_open_transaction,
+                });
+            }
+            Err(error) => error,
+        };
+        if let Err(rollback_error) = self.run_batch(rollback).await {
+            log::error!("rollback failed: {rollback_error:#}");
+        }
+        if !in_open_transaction {
+            return Err(error);
+        }
+        // Some errors end the whole transaction (`SET XACT_ABORT ON`, deadlocks) or doom it.
+        match self.transaction_state().await {
+            Ok(TransactionState { count: 0, .. }) => {
+                Err(error.context("the console's open transaction was rolled back too"))
+            }
+            Ok(TransactionState { doomed: true, .. }) => Err(error.context(
+                "the console's open transaction can no longer commit and needs a ROLLBACK",
+            )),
+            Ok(_) => Err(error),
+            Err(state_error) => {
+                log::error!("couldn't read the transaction state: {state_error:#}");
+                Err(error)
             }
         }
-        result
+    }
+
+    async fn transaction_state(&mut self) -> Result<TransactionState> {
+        let rows = self
+            .query_rows("SELECT @@TRANCOUNT, XACT_STATE()", &[])
+            .await?;
+        let row = rows
+            .first()
+            .context("SQL Server returned no transaction state")?;
+        Ok(TransactionState {
+            count: row.get::<i32, _>(0).unwrap_or(0),
+            doomed: row.get::<i16, _>(1) == Some(-1),
+        })
+    }
+
+    async fn run_batch(&mut self, sql: &str) -> Result<()> {
+        self.client.simple_query(sql).await?.into_results().await?;
+        Ok(())
     }
 
     async fn apply_in_transaction(
@@ -683,16 +722,11 @@ impl SqlServerClient {
     }
 }
 
-trait LogRollbackError {
-    fn log_rollback_error(self);
-}
-
-impl<T> LogRollbackError for tiberius::Result<T> {
-    fn log_rollback_error(self) {
-        if let Err(error) = self {
-            log::error!("rollback failed: {error}");
-        }
-    }
+struct TransactionState {
+    /// `@@TRANCOUNT`.
+    count: i32,
+    /// `XACT_STATE()` is -1: the transaction can only be rolled back.
+    doomed: bool,
 }
 
 const PACKET_HEADER_LENGTH: usize = 8;

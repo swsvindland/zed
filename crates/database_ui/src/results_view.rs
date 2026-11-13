@@ -1098,17 +1098,22 @@ impl QueryResultsView {
             this.update_in(cx, |this, window, cx| {
                 this.push_task = None;
                 match result {
-                    Ok(_) => {
+                    Ok(applied) => {
                         for set in &mut this.result_sets {
                             set.edits = PendingEdits::default();
                         }
                         let sql = this.sql.clone();
                         this.run(sql, window, cx);
+                        let changes = if count == 1 { "change" } else { "changes" };
                         this.notice = Some(
-                            format!(
-                                "Pushed {count} {} in one transaction.",
-                                if count == 1 { "change" } else { "changes" }
-                            )
+                            if applied.in_open_transaction {
+                                format!(
+                                    "Pushed {count} {changes} into the console's open \
+                                     transaction. They're saved when it commits."
+                                )
+                            } else {
+                                format!("Pushed {count} {changes} in one transaction.")
+                            }
                             .into(),
                         );
                     }

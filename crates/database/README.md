@@ -23,7 +23,13 @@ It has no UI; drivers are async and run on the Tokio runtime from `gpui_tokio`.
   schemas / tables / views / columns, decides whether a result is editable
   (`editability`: one statement, one table, primary key present in the result; it describes
   the statement without running it) and applies edits in a single transaction (`apply`),
-  rolling back if an update or delete doesn't hit exactly one row. Values come back as text,
+  rolling back if an update or delete doesn't hit exactly one row. On SQL Server, when the
+  session already has a transaction open (a console's `BEGIN TRANSACTION`), `apply` takes a
+  savepoint instead: a failed push rolls back only to it, a successful one is committed with
+  that transaction (`Applied::in_open_transaction`), and an error that ended or doomed the
+  transaction says so. On PostgreSQL `apply` still sends its own `BEGIN` and `COMMIT`, which
+  commits or aborts an open transaction block; it's unchanged because there's no live
+  PostgreSQL test to check a fix against. Values come back as text,
   with `None` for SQL `NULL`.
 - **Running statements** (`execution`, `Client::execute`): rows are sent as
   `ExecutionEvent`s while they arrive, and each result set pauses at the profile's

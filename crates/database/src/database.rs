@@ -91,6 +91,16 @@ pub struct EditTarget {
 /// Either the result can be edited, or the reason it can't, phrased for the user.
 pub type Editability = std::result::Result<EditTarget, String>;
 
+/// What [`Client::apply`] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Applied {
+    /// The affected row count of each statement.
+    pub counts: Vec<u64>,
+    /// The changes went into a transaction the session already had open, so they're only
+    /// committed when that transaction is.
+    pub in_open_transaction: bool,
+}
+
 pub enum Client {
     SqlServer(sql_server::SqlServerClient),
     Postgres(postgres::PostgresClient),
@@ -195,8 +205,10 @@ impl Client {
     }
 
     /// Runs the statements in one transaction, rolling back if any fails or if an update or
-    /// delete doesn't touch exactly one row. Returns the affected row count of each statement.
-    pub async fn apply(&mut self, statements: &[ParameterizedStatement]) -> Result<Vec<u64>> {
+    /// delete doesn't touch exactly one row. On SQL Server, inside a transaction the session
+    /// already has open, it rolls back only its own changes and leaves the commit to that
+    /// transaction.
+    pub async fn apply(&mut self, statements: &[ParameterizedStatement]) -> Result<Applied> {
         match self {
             Client::SqlServer(client) => client.apply(statements).await,
             Client::Postgres(client) => client.apply(statements).await,
@@ -215,7 +227,7 @@ fn check_affected(statement: &ParameterizedStatement, affected: u64) -> Result<(
     if statement.expect_one_row && affected != 1 {
         anyhow::bail!(
             "{affected} rows were affected by `{}` (expected exactly 1). The row may have been \
-             changed or deleted since it was read. All changes were rolled back.",
+             changed or deleted since it was read. The push was rolled back.",
             statement.sql
         );
     }

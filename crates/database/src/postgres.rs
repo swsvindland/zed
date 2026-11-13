@@ -6,7 +6,7 @@ use postgres_native_tls::MakeTlsConnector;
 use tokio_postgres::{SimpleQueryMessage, config::SslMode, types::ToSql};
 
 use crate::{
-    ColumnInfo, ColumnSummary, ConnectionProfile, DatabaseObject, EditTarget, Editability,
+    Applied, ColumnInfo, ColumnSummary, ConnectionProfile, DatabaseObject, EditTarget, Editability,
     ObjectKind, SessionReset,
     catalog::{Catalog, ObjectName},
     check_affected,
@@ -396,7 +396,9 @@ impl PostgresClient {
         }))
     }
 
-    pub async fn apply(&mut self, statements: &[ParameterizedStatement]) -> Result<Vec<u64>> {
+    /// Note that `transaction` sends `BEGIN` and `COMMIT` even when the console left a
+    /// transaction block open, which commits (or, on failure, aborts) that block too.
+    pub async fn apply(&mut self, statements: &[ParameterizedStatement]) -> Result<Applied> {
         let transaction = self.client.transaction().await?;
         let mut counts = Vec::with_capacity(statements.len());
         for statement in statements {
@@ -413,7 +415,10 @@ impl PostgresClient {
             counts.push(affected);
         }
         transaction.commit().await?;
-        Ok(counts)
+        Ok(Applied {
+            counts,
+            in_open_transaction: false,
+        })
     }
 }
 

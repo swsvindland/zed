@@ -127,7 +127,7 @@ impl Render for PushReviewModal {
             .child(
                 Label::new(
                     "Runs in one transaction with bound parameters. Updates and deletes must each \
-                     affect exactly one row, or everything is rolled back.",
+                     affect exactly one row, or the push is rolled back.",
                 )
                 .size(LabelSize::Small)
                 .color(Color::Muted),
