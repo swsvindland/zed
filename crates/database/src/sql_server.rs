@@ -194,10 +194,40 @@ impl SqlServerClient {
         })
     }
 
+    /// Runs `sql` batch by batch on this session, split on `GO` lines the way SSMS and sqlcmd
+    /// do; `GO n` runs the batch before it `n` times. It stops at the first batch that fails or
+    /// is stopped, and what earlier batches returned has already been sent by then. The run's
+    /// timeout covers all of its batches together.
+    pub async fn execute(&mut self, sql: &str, execution: &mut Execution) -> Result<ExecutionEnd> {
+        let batches = sql::split_batches(sql);
+        for (index, batch) in batches.iter().enumerate() {
+            let text = &sql[batch.range.clone()];
+            for run in 1..=batch.repeat {
+                // Between batches nothing is in flight, so a stop needs no Attention.
+                if let Some(interrupt) = execution.interrupted() {
+                    return Ok(interrupt.into());
+                }
+                let result = self.execute_batch(text, execution).await;
+                let end = result.map_err(|error| match batch_label(sql, &batches, index, run) {
+                    Some(label) => error.context(label),
+                    None => error,
+                })?;
+                if end != ExecutionEnd::Completed {
+                    return Ok(end);
+                }
+            }
+        }
+        Ok(ExecutionEnd::Completed)
+    }
+
     /// Runs `sql` as a SQL batch. `sp_executesql` (tiberius's `Client::execute`) would scope
     /// temp tables, `USE`, `SET` options and transactions to the call, so even statements that
     /// return no rows don't go through it.
-    pub async fn execute(&mut self, sql: &str, execution: &mut Execution) -> Result<ExecutionEnd> {
+    async fn execute_batch(
+        &mut self,
+        sql: &str,
+        execution: &mut Execution,
+    ) -> Result<ExecutionEnd> {
         let stopped = match execution.guard(self.client.simple_query(sql)).await {
             Err(interrupt) => Stopped::Interrupted(interrupt),
             Ok(stream) => {
@@ -478,6 +508,15 @@ impl SqlServerClient {
     }
 
     pub async fn editability(&mut self, sql: &str) -> Result<Editability> {
+        // SQL Server can't describe `GO` lines, and `GO n` returns the result several times.
+        let sql = match sql::split_batches(sql).as_slice() {
+            [batch] if batch.repeat == 1 => &sql[batch.range.clone()],
+            _ => {
+                return Ok(Err(
+                    "Results can only be edited when a single statement was run.".into(),
+                ));
+            }
+        };
         let rows = match self
             .query_rows(
                 "EXEC sp_describe_first_result_set @tsql = @P1, @params = NULL, @browse_information_mode = 1",
@@ -952,6 +991,27 @@ fn reports_row_count(sql: &str) -> bool {
             == 1
 }
 
+/// Says which batch of a script failed, when there's more than one to choose from. Its line is
+/// counted in the text that ran, and SQL Server's own line numbers count from there.
+fn batch_label(sql: &str, batches: &[sql::Batch], index: usize, run: u32) -> Option<String> {
+    let batch = batches.get(index)?;
+    let repetition = (batch.repeat > 1).then(|| format!("repetition {run} of {}", batch.repeat));
+    if batches.len() < 2 {
+        return repetition.map(|repetition| format!("running {repetition} of the batch"));
+    }
+    let line = sql.get(..batch.range.start)?.matches('\n').count() + 1;
+    let mut label = format!(
+        "running batch {} of {} (from line {line})",
+        index + 1,
+        batches.len()
+    );
+    if let Some(repetition) = repetition {
+        label.push_str(", ");
+        label.push_str(&repetition);
+    }
+    Some(label)
+}
+
 fn string(row: &Row, index: usize) -> Option<String> {
     row.get::<&str, _>(index).map(ToOwned::to_owned)
 }
@@ -1081,6 +1141,25 @@ mod tests {
             AttentionAckFilter::new(Trickle(wire.clone(), 0), Arc::new(AtomicBool::new(false)));
         futures::executor::block_on(disabled.read_to_end(&mut untouched)).unwrap();
         assert_eq!(untouched, wire);
+    }
+
+    #[test]
+    fn names_the_failing_batch() {
+        let label = |sql: &str, index, run| {
+            batch_label(sql, &sql::split_batches(sql), index, run).unwrap_or_default()
+        };
+        assert_eq!(label("SELECT 1", 0, 1), "");
+        assert_eq!(
+            label("SELECT 1\nGO 5", 0, 3),
+            "running repetition 3 of 5 of the batch"
+        );
+        let script = "SELECT 1\nGO\n\nSELECT 2\nGO 4\nSELECT 3";
+        assert_eq!(label(script, 0, 1), "running batch 1 of 3 (from line 1)");
+        assert_eq!(
+            label(script, 1, 2),
+            "running batch 2 of 3 (from line 3), repetition 2 of 4"
+        );
+        assert_eq!(label(script, 2, 1), "running batch 3 of 3 (from line 6)");
     }
 
     #[test]

@@ -130,6 +130,68 @@ pub fn split_statements(text: &str, dialect: Dialect) -> Vec<Range<usize>> {
     ranges
 }
 
+/// One SQL Server batch of a script: the text between `GO` lines.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Batch {
+    /// Byte offsets into the script, from the start of the line after the previous `GO` (or of
+    /// the script) to the batch's last non-blank character. Starting there makes SQL Server
+    /// number the batch's lines the way it does for SSMS and sqlcmd.
+    pub range: Range<usize>,
+    /// How many times to run it: `n` for `GO n`, otherwise 1.
+    pub repeat: u32,
+}
+
+/// Splits a SQL Server script into the batches that `GO` lines separate, the way SSMS and
+/// sqlcmd do. `GO` is a client-side separator that SQL Server itself rejects. A `GO` line holds
+/// `GO` alone, or `GO n` (run the batch `n` times), optionally followed by a `--` comment. Lines
+/// inside strings, quoted identifiers and block comments (which nest in T-SQL) don't count.
+/// Batches holding only whitespace and comments are dropped.
+pub fn split_batches(text: &str) -> Vec<Batch> {
+    let bytes = text.as_bytes();
+    let mut batches = Vec::new();
+    let push = |batches: &mut Vec<Batch>, range: Range<usize>, repeat: u32| {
+        let content = trim_range(text, range.clone());
+        if !content.is_empty() && !is_only_comments(&text[content.clone()]) {
+            batches.push(Batch {
+                range: range.start..content.end,
+                repeat,
+            });
+        }
+    };
+    let mut start = 0;
+    let mut index = 0;
+    let mut at_line_start = true;
+    while index < bytes.len() {
+        if std::mem::take(&mut at_line_start) {
+            let line_end = find_byte(bytes, index, b'\n').unwrap_or(bytes.len());
+            if let Some(repeat) = go_line_repeat(&text[index..line_end]) {
+                push(&mut batches, start..index, repeat);
+                start = (line_end + 1).min(bytes.len());
+                index = line_end;
+                continue;
+            }
+        }
+        match bytes[index] {
+            b'\'' => index = skip_quoted(bytes, index, b'\''),
+            b'"' => index = skip_quoted(bytes, index, b'"'),
+            b'[' => index = skip_quoted(bytes, index, b']'),
+            b'-' if bytes.get(index + 1) == Some(&b'-') => {
+                index = find_byte(bytes, index, b'\n').unwrap_or(bytes.len());
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index = skip_nested_comment(bytes, index);
+            }
+            b'\n' => {
+                at_line_start = true;
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    push(&mut batches, start..bytes.len(), 1);
+    batches
+}
+
 /// Returns the statement containing `offset`, or the closest statement before it when the
 /// cursor sits in whitespace between statements.
 pub fn statement_at(text: &str, offset: usize, dialect: Dialect) -> Option<Range<usize>> {
@@ -274,15 +336,46 @@ fn for_each_word(text: &str, mut f: impl FnMut(&str)) {
 }
 
 fn is_go_line(line: &str) -> bool {
+    go_line_repeat(line).is_some()
+}
+
+/// For a `GO` or `GO n` line (`n` at least 1, a trailing `--` comment allowed), how many times
+/// it runs the batch before it.
+fn go_line_repeat(line: &str) -> Option<u32> {
+    let line = line.find("--").map_or(line, |comment| &line[..comment]);
     let mut parts = line.split_whitespace();
-    let Some(first) = parts.next() else {
-        return false;
+    if !parts.next()?.eq_ignore_ascii_case("GO") {
+        return None;
+    }
+    let repeat = match parts.next() {
+        Some(count) => count.parse::<u32>().ok().filter(|count| *count > 0)?,
+        None => 1,
     };
-    first.eq_ignore_ascii_case("GO")
-        && parts
-            .next()
-            .is_none_or(|count| count.parse::<u32>().is_ok())
-        && parts.next().is_none()
+    parts.next().is_none().then_some(repeat)
+}
+
+/// Skips a block comment starting at `start` (the `/*`), counting nested `/* … */` pairs.
+/// Returns the index just past its end.
+fn skip_nested_comment(bytes: &[u8], start: usize) -> usize {
+    let mut depth = 0usize;
+    let mut index = start;
+    while index < bytes.len() {
+        match (bytes[index], bytes.get(index + 1)) {
+            (b'/', Some(b'*')) => {
+                depth += 1;
+                index += 2;
+            }
+            (b'*', Some(b'/')) => {
+                depth -= 1;
+                index += 2;
+                if depth == 0 {
+                    return index;
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    bytes.len()
 }
 
 fn is_word_start(byte: u8) -> bool {
@@ -632,6 +725,77 @@ mod tests {
                 "SELECT $1, 2"
             ]
         );
+    }
+
+    fn batches(text: &str) -> Vec<(&str, u32)> {
+        split_batches(text)
+            .into_iter()
+            .map(|batch| (&text[batch.range], batch.repeat))
+            .collect()
+    }
+
+    #[test]
+    fn splits_batches_on_go_lines() {
+        let script = "CREATE TABLE #t (a int);\nINSERT INTO #t VALUES (1)\nGO\n\
+                      CREATE PROCEDURE p AS\nBEGIN\n  SELECT 1;\n\n  SELECT 2;\nEND\n  go  \n\
+                      EXEC p\nGO 3\nSELECT 4";
+        assert_eq!(
+            batches(script),
+            vec![
+                ("CREATE TABLE #t (a int);\nINSERT INTO #t VALUES (1)", 1),
+                (
+                    "CREATE PROCEDURE p AS\nBEGIN\n  SELECT 1;\n\n  SELECT 2;\nEND",
+                    1
+                ),
+                ("EXEC p", 3),
+                ("SELECT 4", 1),
+            ]
+        );
+        // Without `GO` the whole script is one batch, blank lines and semicolons included.
+        assert_eq!(
+            batches("SELECT 1;\n\nSELECT 2"),
+            vec![("SELECT 1;\n\nSELECT 2", 1)]
+        );
+        assert_eq!(batches(""), Vec::<(&str, u32)>::new());
+    }
+
+    #[test]
+    fn go_lines_at_the_edges_and_empty_batches() {
+        // A leading `GO`, repeated `GO`s, comment-only batches and a trailing `GO` add nothing.
+        let script =
+            "GO\nSELECT 1\nGO\nGO\n-- only a note\n/* and a block */\nGO\r\nSELECT 2\r\nGO\r\n";
+        assert_eq!(batches(script), vec![("SELECT 1", 1), ("SELECT 2", 1)]);
+        assert_eq!(
+            batches("SELECT 1\nGO 2 -- twice\nSELECT 2\nGo -- once"),
+            vec![("SELECT 1", 2), ("SELECT 2", 1)]
+        );
+        // A batch keeps its leading lines, so SQL Server's line numbers count from the `GO`.
+        assert_eq!(
+            batches("\nSELECT 1\nGO\n\n-- note\nSELECT 2\n\n"),
+            vec![("\nSELECT 1", 1), ("\n-- note\nSELECT 2", 1)]
+        );
+    }
+
+    #[test]
+    fn go_inside_strings_comments_and_identifiers_is_text() {
+        let script = "SELECT 'a\nGO\nb' AS [x\nGO\ny], \"c\nGO\n\" AS d\n\
+                      /* outer /* inner */\nGO\nstill a comment */\n-- GO\nSELECT 2\nGO";
+        assert_eq!(batches(script), vec![(&script[..script.len() - 3], 1)]);
+    }
+
+    #[test]
+    fn only_whole_go_lines_separate_batches() {
+        for script in [
+            "SELECT 1\nGO 0\nSELECT 2",
+            "SELECT 1\nGO x\nSELECT 2",
+            "SELECT 1\nGO 2 3\nSELECT 2",
+            "SELECT 1\nGO;\nSELECT 2",
+            "SELECT 1\nGOTO done\ndone: SELECT 2",
+            "SELECT 1 GO\nSELECT 2",
+            "SELECT 1\nSELECT 2 -- then\n-- GO\nSELECT 3",
+        ] {
+            assert_eq!(batches(script), vec![(script, 1)], "{script:?}");
+        }
     }
 
     #[test]

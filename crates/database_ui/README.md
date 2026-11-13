@@ -29,6 +29,12 @@ so it persists and keeps its connection. Any other `.sql` file can be bound with
 
 - `ctrl-enter` (`cmd-enter` on macOS), `database: run statement`, runs the selection or the
   statement under the cursor. `ctrl-shift-enter`, `database: run script`, runs the whole file.
+- On SQL Server, `GO` lines split a script (or a selection) into batches, as in SSMS and
+  sqlcmd. The batches run one after another on the console's session, and `GO 5` runs the
+  batch before it five times. The first batch that fails ends the run: the results and row
+  counts of the batches before it stay, and the error names the batch and the line it starts
+  on, counted in what ran. SQL Server's own line numbers in the error count from that line.
+  Stop and the query timeout apply to the whole run.
 - Results open in a pane below the editor: a grid per result set (sortable and filterable,
   from `tabular_data_preview`), plus a **Messages** tab with row counts, timing and errors.
   Each console has its own session, so transactions, temp tables, `USE` and `SET` options carry
@@ -89,5 +95,5 @@ read-only.
 ## Tests
 
 With `ZED_DATABASE_TEST_SQL_SERVER` set (see the `database` README), `cargo test -p database_ui`
-also drives the panel, a console, the grid, paging, Stop, NULL editing, completion and a push
-against that server, in a `ZedDatabaseUiTest` database.
+also drives the panel, a console, the grid, paging, Stop, NULL editing, completion, a push and
+a script with `GO` batches against that server, in a `ZedDatabaseUiTest` database.

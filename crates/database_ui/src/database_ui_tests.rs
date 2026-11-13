@@ -14,7 +14,7 @@ use tabular_data_preview::types::{AnyColumn, DataCellId, DataRow, TableCell};
 use workspace::{AppState, MultiWorkspace, Workspace};
 
 use crate::{
-    DatabasePanel, DatabaseStore, RunStatement, StopStatement,
+    DatabasePanel, DatabaseStore, RunScript, RunStatement, StopStatement,
     console::{self, ConsoleTarget},
     database_panel::NodeKey,
     push_modal::PushReviewModal,
@@ -344,6 +344,46 @@ async fn test_browse_query_edit_and_push(cx: &mut TestAppContext) {
         })
     })
     .await;
+
+    // Run script sends the whole console batch by batch, split on `GO` lines, and stops at the
+    // first batch that fails with the earlier batches' results still shown.
+    editor.update_in(cx, |editor, window, cx| {
+        editor.set_text(
+            "CREATE OR ALTER PROCEDURE dbo.ItemCount AS SELECT COUNT(*) AS n FROM dbo.Items\n\
+             GO\n\
+             EXEC dbo.ItemCount\n\
+             GO 2\n\
+             SELECT * FROM dbo.NoSuchTable\n\
+             GO\n\
+             SELECT 1 AS Never",
+            window,
+            cx,
+        );
+        window.focus(&editor.focus_handle(cx), cx);
+    });
+    cx.dispatch_action(RunScript);
+    wait_until(cx, "the script to stop at its failing batch", |cx| {
+        results.read_with(cx, |results, _| {
+            !results.is_busy_for_test()
+                && results
+                    .messages_for_test()
+                    .iter()
+                    .any(|message| message.starts_with("Error"))
+        })
+    })
+    .await;
+    results.read_with(cx, |results, _| {
+        assert_eq!(results.summary_for_test().0, vec![1, 1]);
+        assert_eq!(results.value_for_test(1, 0, 0), Some(Some("3".into())));
+        let messages = results.messages_for_test();
+        assert!(
+            messages.iter().any(
+                |message| message.contains("running batch 3 of 4 (from line 5)")
+                    && message.contains("NoSuchTable")
+            ),
+            "{messages:?}"
+        );
+    });
 
     // Production connections need an acknowledgement before pushing.
     cx.update(|_, cx| {
