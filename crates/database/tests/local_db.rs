@@ -62,6 +62,7 @@ async fn sql_server_cancel_paging_and_timeout() -> anyhow::Result<()> {
     let mut client = Client::connect(&profile, None, None).await?;
     // Lives as long as the session does.
     client.run("CREATE TABLE #session_marker (Id int)").await?;
+    client.run("INSERT INTO #session_marker VALUES (1)").await?;
 
     // NULL and the empty string stay distinct.
     let output = client.run("SELECT NULL AS a, '' AS b").await?;
@@ -359,6 +360,7 @@ async fn sql_server_runs_scripts_batch_by_batch() -> anyhow::Result<()> {
 
     let mut client = Client::connect(&profile, Some("tempdb"), None).await?;
     client.run("CREATE TABLE #session_marker (Id int)").await?;
+    client.run("INSERT INTO #session_marker VALUES (1)").await?;
 
     // `CREATE PROCEDURE` has to come first in its batch, and each batch sees what the ones
     // before it made. `GO 3` runs its batch three times, each with its own row count.

@@ -134,6 +134,7 @@ enum RunState {
 }
 
 impl RunState {
+    #[cfg(test)]
     fn is_active(&self) -> bool {
         matches!(
             self,
