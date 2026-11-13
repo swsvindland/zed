@@ -23,6 +23,7 @@ futures.workspace = true
 fuzzy.workspace = true
 globset.workspace = true
 gpui.workspace = true
+language.workspace = true
 log.workspace = true
 picker.workspace = true
 project.workspace = true
@@ -31,6 +32,7 @@ quick-xml.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_json_lenient.workspace = true
+settings.workspace = true
 sysinfo.workspace = true
 task.workspace = true
 ui.workspace = true
@@ -49,5 +51,6 @@ pretty_assertions.workspace = true
 tempfile.workspace = true
 project = { workspace = true, features = ["test-support"] }
 remote_connection = { workspace = true, features = ["test-support"] }
+settings = { workspace = true, features = ["test-support"] }
 util = { workspace = true, features = ["test-support"] }
 workspace = { workspace = true, features = ["test-support"] }

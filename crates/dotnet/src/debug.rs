@@ -1,11 +1,19 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use async_trait::async_trait;
 use collections::{FxHashMap, HashMap};
 use dap::{DapLocator, DebugRequest, adapters::DebugAdapterName};
-use gpui::{BackgroundExecutor, SharedString};
+use gpui::{App, BackgroundExecutor, Global, SharedString};
+use language::{LanguageName, language_settings::AllLanguageSettings};
 use serde::Deserialize;
+use settings::{Settings as _, SettingsStore};
 use task::{BuildTaskDefinition, DebugScenario, LaunchRequest, SpawnInTerminal, TaskTemplate};
 
 use crate::msbuild::{
@@ -30,8 +38,7 @@ const NO_LAUNCH_PROFILE: &str = "";
 const ADAPTER_VARIABLE: &str = "ZED_DOTNET_DEBUG_ADAPTER";
 
 /// The adapter for a program that targets `framework`: dotnet-debugger for the .NET Framework,
-/// and otherwise `preferred`, the first debugger of the C# language (netcoredbg, unless the
-/// user prefers dotnet-debugger).
+/// and otherwise `preferred` (netcoredbg, unless the user prefers dotnet-debugger).
 pub fn adapter_for(framework: Option<&str>, preferred: &str) -> &'static str {
     if preferred == DOTNET_DEBUGGER || framework.is_some_and(is_net_framework) {
         DOTNET_DEBUGGER
@@ -47,7 +54,49 @@ fn is_dotnet_adapter(adapter: &str) -> bool {
 /// Turns `dotnet run` tasks into debug scenarios: the scenario builds the project with
 /// `dotnet build`, then asks MSBuild where the program is and applies the `launchSettings.json`
 /// profile `dotnet run` would have used.
-pub struct DotnetLocator;
+#[derive(Default)]
+pub struct DotnetLocator {
+    /// Whether the user's settings make dotnet-debugger the C# debugger. The adapter that callers
+    /// pass can't tell: when the settings name no debugger, they pass the C# language's first one,
+    /// which is dotnet-debugger too, so that the attach picker starts on it.
+    user_prefers_dotnet_debugger: AtomicBool,
+}
+
+struct GlobalDotnetLocator(Arc<DotnetLocator>);
+
+impl Global for GlobalDotnetLocator {}
+
+impl DotnetLocator {
+    /// The locator, which follows the user's C# debugger setting.
+    pub fn global(cx: &mut App) -> Arc<Self> {
+        if let Some(locator) = cx.try_global::<GlobalDotnetLocator>() {
+            return locator.0.clone();
+        }
+        let locator = Arc::new(Self::default());
+        locator.read_settings(cx);
+        cx.observe_global::<SettingsStore>({
+            let locator = locator.clone();
+            move |cx| locator.read_settings(cx)
+        })
+        .detach();
+        cx.set_global(GlobalDotnetLocator(locator.clone()));
+        locator
+    }
+
+    fn read_settings(&self, cx: &App) {
+        let settings = AllLanguageSettings::get_global(cx).language(
+            None,
+            Some(&LanguageName::new_static("C#")),
+            cx,
+        );
+        let prefers_dotnet_debugger = settings
+            .debuggers
+            .first()
+            .is_some_and(|debugger| debugger == DOTNET_DEBUGGER);
+        self.user_prefers_dotnet_debugger
+            .store(prefers_dotnet_debugger, Ordering::Relaxed);
+    }
+}
 
 #[async_trait]
 impl DapLocator for DotnetLocator {
@@ -69,7 +118,12 @@ impl DapLocator for DotnetLocator {
             let cwd = build_config.cwd.as_deref()?;
             target_framework(Path::new(cwd), run_arguments.project.as_deref())
         });
-        let adapter = adapter_for(framework.as_deref(), adapter.as_ref());
+        let preferred = if self.user_prefers_dotnet_debugger.load(Ordering::Relaxed) {
+            adapter.as_ref()
+        } else {
+            NETCOREDBG
+        };
+        let adapter = adapter_for(framework.as_deref(), preferred);
 
         let mut build_task = TaskTemplate {
             label: format!("Build for {resolved_label}"),
@@ -634,7 +688,15 @@ mod tests {
     }
 
     fn create_scenario(task: &TaskTemplate, adapter: &str) -> Option<DebugScenario> {
-        futures::executor::block_on(DotnetLocator.create_scenario(
+        create_scenario_with(&DotnetLocator::default(), task, adapter)
+    }
+
+    fn create_scenario_with(
+        locator: &DotnetLocator,
+        task: &TaskTemplate,
+        adapter: &str,
+    ) -> Option<DebugScenario> {
+        futures::executor::block_on(locator.create_scenario(
             task,
             "dotnet run",
             &DebugAdapterName(adapter.to_owned().into()),
@@ -695,12 +757,26 @@ mod tests {
         assert_eq!(adapter_of(&scenario), NETCOREDBG);
         let scenario = create_scenario(&api_task(&["--framework", "net48"]), NETCOREDBG).unwrap();
         assert_eq!(adapter_of(&scenario), DOTNET_DEBUGGER);
+
+        // dotnet-debugger comes first in the C# language's debuggers, so callers pass it when the
+        // user's settings name no debugger; only a setting makes it the debugger for .NET (Core).
         let scenario = create_scenario(&api_task(&[]), DOTNET_DEBUGGER).unwrap();
+        assert_eq!(adapter_of(&scenario), NETCOREDBG);
+        let prefers_dotnet_debugger = DotnetLocator {
+            user_prefers_dotnet_debugger: AtomicBool::new(true),
+        };
+        let scenario =
+            create_scenario_with(&prefers_dotnet_debugger, &api_task(&[]), DOTNET_DEBUGGER)
+                .unwrap();
         assert_eq!(adapter_of(&scenario), DOTNET_DEBUGGER);
+        // A worktree's settings can still pick netcoredbg.
+        let scenario =
+            create_scenario_with(&prefers_dotnet_debugger, &api_task(&[]), NETCOREDBG).unwrap();
+        assert_eq!(adapter_of(&scenario), NETCOREDBG);
 
         // Before the task's variables are resolved, the project can't be found.
         let unresolved = dotnet_run_task(&["run"], Some(Path::new("$ZED_DIRNAME")));
-        let scenario = create_scenario(&unresolved, NETCOREDBG).unwrap();
+        let scenario = create_scenario(&unresolved, DOTNET_DEBUGGER).unwrap();
         assert_eq!(adapter_of(&scenario), NETCOREDBG);
         assert_eq!(
             build_env(&scenario)
@@ -711,6 +787,44 @@ mod tests {
 
         assert!(create_scenario(&unresolved, "codelldb").is_none());
         assert!(create_scenario(&dotnet_run_task(&["test"], None), NETCOREDBG).is_none());
+    }
+
+    #[gpui::test]
+    fn follows_the_csharp_debugger_setting(cx: &mut gpui::TestAppContext) {
+        use gpui::BorrowAppContext as _;
+
+        fn set_csharp_debuggers(debuggers: &[&str], cx: &mut App) {
+            let debuggers = debuggers.iter().map(|debugger| (*debugger).to_owned());
+            let debuggers = debuggers.collect();
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.project.all_languages.languages.0.insert(
+                        "C#".into(),
+                        settings::LanguageSettingsContent {
+                            debuggers: Some(debuggers),
+                            ..Default::default()
+                        },
+                    );
+                })
+            });
+        }
+
+        let locator = cx.update(|cx| {
+            let store = SettingsStore::test(cx);
+            cx.set_global(store);
+            DotnetLocator::global(cx)
+        });
+        let prefers_dotnet_debugger =
+            || locator.user_prefers_dotnet_debugger.load(Ordering::Relaxed);
+        assert!(!prefers_dotnet_debugger());
+
+        // The locator reads the settings when the update that changed them ends.
+        cx.update(|cx| set_csharp_debuggers(&[DOTNET_DEBUGGER], cx));
+        assert!(prefers_dotnet_debugger());
+        cx.update(|cx| set_csharp_debuggers(&[NETCOREDBG, DOTNET_DEBUGGER], cx));
+        assert!(!prefers_dotnet_debugger());
+        // Each workspace registers the same locator.
+        cx.update(|cx| assert!(Arc::ptr_eq(&locator, &DotnetLocator::global(cx))));
     }
 
     #[test]

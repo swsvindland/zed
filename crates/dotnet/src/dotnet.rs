@@ -1,4 +1,5 @@
 mod debug;
+mod iis_express;
 mod msbuild;
 mod run_configuration_picker;
 mod solution_view;
@@ -21,7 +22,6 @@ use gpui::{
 };
 use project::{Project, TaskSourceKind, WorktreeId};
 use project_panel::ProjectView;
-use sysinfo::{ProcessRefreshKind, RefreshKind, System, UpdateKind};
 use task::{
     DebugScenario, RevealStrategy, SaveStrategy, SharedTaskContext, TaskContext, TaskTemplate,
 };
@@ -55,6 +55,9 @@ actions!(
         Run,
         /// Builds the selected .NET run configuration and starts it under the debugger.
         Debug,
+        /// Attaches the debugger to a running 64-bit IIS Express, such as one that `dotnet: run`
+        /// started.
+        AttachToIisExpress,
         /// Selects the .NET project and launch profile that `dotnet: run` starts.
         SelectRunConfiguration,
         /// Builds the project of the selected .NET run configuration.
@@ -81,7 +84,8 @@ pub fn register(
     cx: &mut Context<Workspace>,
 ) -> Entity<RunConfigurationIndicator> {
     // The registry is keyed by name, so registering again for each workspace is harmless.
-    DapRegistry::global(cx).add_locator(Arc::new(debug::DotnetLocator));
+    let locator = debug::DotnetLocator::global(cx);
+    DapRegistry::global(cx).add_locator(locator);
     let projects = cx.new(|cx| DotnetProjects::new(workspace.project().clone(), cx));
 
     workspace.register_action({
@@ -91,6 +95,9 @@ pub fn register(
     workspace.register_action({
         let projects = projects.clone();
         move |workspace, _: &Debug, window, cx| debug(&projects, workspace, window, cx)
+    });
+    workspace.register_action(|workspace, _: &AttachToIisExpress, window, cx| {
+        iis_express::attach_to_iis_express(workspace, window, cx)
     });
     workspace.register_action({
         let projects = projects.clone();
@@ -207,7 +214,6 @@ struct IisExpressDebugPlan {
 
 /// IIS Express loads the CLR a few hundred milliseconds after it starts; attaching earlier fails.
 const CLR_LOAD_TIMEOUT: Duration = Duration::from_secs(30);
-const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Runs `plan` in a terminal like `dotnet: run`, waits for its IIS Express process to load the
 /// CLR, and attaches dotnet-debugger to it. Stopping the debug session stops IIS Express.
@@ -265,17 +271,24 @@ async fn debug_iis_express(
         let site_argument = site_argument.clone();
         let process_id = cx
             .background_spawn(async move {
-                find_iis_express_process(&iis_express, &site_argument, started_at)
+                iis_express::find_site_process(
+                    &iis_express::running_processes(),
+                    &iis_express,
+                    &site_argument,
+                    started_at,
+                )
             })
             .await;
         if let Some(process_id) = process_id {
             break process_id;
         }
-        cx.background_executor().timer(PROCESS_POLL_INTERVAL).await;
+        cx.background_executor()
+            .timer(iis_express::PROCESS_POLL_INTERVAL)
+            .await;
     };
 
     let waiting_since = Instant::now();
-    while !has_clr(process_id).await {
+    while !iis_express::has_clr(process_id).await {
         if let Some(error) = ended() {
             return Err(error);
         }
@@ -286,7 +299,9 @@ async fn debug_iis_express(
                 CLR_LOAD_TIMEOUT.as_secs()
             );
         }
-        cx.background_executor().timer(PROCESS_POLL_INTERVAL).await;
+        cx.background_executor()
+            .timer(iis_express::PROCESS_POLL_INTERVAL)
+            .await;
     }
 
     workspace.update_in(cx, |workspace, window, cx| {
@@ -305,56 +320,6 @@ fn unix_time_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs())
-}
-
-/// The newest `iis_express` process serving the site that was started after `started_at`.
-fn find_iis_express_process(
-    iis_express: &Path,
-    site_argument: &str,
-    started_at: u64,
-) -> Option<u32> {
-    let refresh_kind = RefreshKind::nothing().with_processes(
-        ProcessRefreshKind::nothing()
-            .without_tasks()
-            .with_exe(UpdateKind::Always)
-            .with_cmd(UpdateKind::Always),
-    );
-    System::new_with_specifics(refresh_kind)
-        .processes()
-        .values()
-        .filter(|process| {
-            process
-                .name()
-                .to_string_lossy()
-                .eq_ignore_ascii_case("iisexpress.exe")
-        })
-        // Process start times have a resolution of one second.
-        .filter(|process| process.start_time() + 1 >= started_at)
-        .filter(|process| process.exe().is_some_and(|exe| same_path(exe, iis_express)))
-        .filter(|process| {
-            process.cmd().iter().any(|argument| {
-                argument
-                    .to_string_lossy()
-                    .eq_ignore_ascii_case(site_argument)
-            })
-        })
-        .max_by_key(|process| process.start_time())
-        .map(|process| process.pid().as_u32())
-}
-
-/// Whether the process has loaded `clr.dll`, the .NET Framework 4 runtime.
-async fn has_clr(process_id: u32) -> bool {
-    let output = util::command::new_command("tasklist")
-        .args(["/M", "clr.dll", "/FI"])
-        .arg(format!("PID eq {process_id}"))
-        .args(["/FO", "CSV", "/NH"])
-        .output()
-        .await;
-    // Only matching processes are listed (`"iisexpress.exe","1234","clr.dll"`); otherwise
-    // tasklist prints a localized message.
-    output.is_ok_and(|output| {
-        String::from_utf8_lossy(&output.stdout).contains(&format!("\"{process_id}\""))
-    })
 }
 
 fn build_project(
@@ -1399,8 +1364,7 @@ mod tests {
 
         // Only the solution file is open, as when a .sln is opened on its own.
         let (solutions, projects) =
-            load_project_model(fs.as_ref(), vec![PathBuf::from(path!("/root/app/App.sln"))])
-                .await;
+            load_project_model(fs.as_ref(), vec![PathBuf::from(path!("/root/app/App.sln"))]).await;
 
         assert_eq!(solutions.len(), 1);
         let mut project_names = projects
