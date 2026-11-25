@@ -247,9 +247,7 @@ fn push_record<'a>(
         }
         match value {
             None => {}
-            Some(value)
-                if value.is_empty() || value.contains([delimiter, '"', '\r', '\n']) =>
-            {
+            Some(value) if value.is_empty() || value.contains([delimiter, '"', '\r', '\n']) => {
                 text.push('"');
                 text.push_str(&value.replace('"', "\"\""));
                 text.push('"');
@@ -371,9 +369,7 @@ mod tests {
         data.status = RunStatus::Failed("Invalid object name 'x'.".into());
         let text = render(ExportFormat::Markdown, &data, 0);
         assert!(
-            text.contains(
-                "- Status: Failed (Invalid object name 'x'.). Rows may be incomplete.\n"
-            ),
+            text.contains("- Status: Failed (Invalid object name 'x'.). Rows may be incomplete.\n"),
             "{text}"
         );
     }

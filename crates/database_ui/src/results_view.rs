@@ -4,10 +4,12 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    path::PathBuf,
     time::{Duration, Instant},
 };
 
-use anyhow::anyhow;
+use anyhow::{Context as _, anyhow};
+use chrono::{DateTime, Local};
 use database::{
     ColumnInfo, ConnectionProfile, EditTarget, Editability, ExecutionEnd, ExecutionEvent,
     ExecutionHandle, Fetch, PoolKey, ResultSet,
@@ -25,12 +27,13 @@ use tabular_data_preview::{
 };
 use ui::{IconButton, IconSize, SpinnerLabel, Tooltip, prelude::*, table_row::TableRow};
 use util::ResultExt as _;
-use workspace::{Item, SplitDirection, Workspace};
+use workspace::{Item, SplitDirection, Toast, Workspace, notifications::NotificationId};
 
 use crate::{
     DatabaseStore,
     console::{ConsoleTarget, session_for_buffer},
     database_panel::environment_color,
+    export::{self, ExportData, ExportFormat, RunStatus},
     push_modal::PushReviewModal,
 };
 
@@ -43,6 +46,8 @@ gpui::actions!(
         FetchNextPage,
         /// Fetches every remaining row of a result that stopped at the fetch limit.
         FetchAllRows,
+        /// Saves the results to a Markdown, JSON, CSV or TSV file, picked by its extension.
+        ExportResults,
     ]
 );
 
@@ -154,6 +159,13 @@ enum Outcome {
     RowsAffected(u64),
 }
 
+/// An export waiting for a paused run to fetch its remaining rows.
+struct PendingExport {
+    path: PathBuf,
+    /// The result set written by formats that hold one table.
+    table: usize,
+}
+
 pub struct QueryResultsView {
     workspace: WeakEntity<Workspace>,
     buffer_id: EntityId,
@@ -166,6 +178,9 @@ pub struct QueryResultsView {
     paused_for: Duration,
     paused_since: Option<Instant>,
     elapsed: Option<Duration>,
+    started_at: Option<DateTime<Local>>,
+    pending_export: Option<PendingExport>,
+    export_task: Option<Task<()>>,
     result_sets: Vec<ResultSetView>,
     outcomes: Vec<Outcome>,
     error: Option<SharedString>,
@@ -230,6 +245,9 @@ impl QueryResultsView {
             paused_for: Duration::ZERO,
             paused_since: None,
             elapsed: None,
+            started_at: None,
+            pending_export: None,
+            export_task: None,
             result_sets: Vec::new(),
             outcomes: Vec::new(),
             error: None,
@@ -303,6 +321,9 @@ impl QueryResultsView {
         self.error = None;
         self.editability = None;
         self.elapsed = None;
+        self.started_at = Some(Local::now());
+        // An export waiting on the previous run's rows would otherwise write this run's.
+        self.pending_export = None;
         self.paused_for = Duration::ZERO;
         self.paused_since = None;
         self.active_tab = Tab::Messages;
@@ -562,7 +583,160 @@ impl QueryResultsView {
         }
         self.refresh_stale_grids(true, cx);
         self.rebuild_messages();
+        if let Some(pending) = self.pending_export.take() {
+            match self.state {
+                RunState::Finished => self.write_export(pending.path, pending.table, cx),
+                RunState::Failed => self.show_export_toast(
+                    "Export cancelled: the run failed before every row arrived.".into(),
+                    false,
+                    cx,
+                ),
+                _ => self.show_export_toast(
+                    "Export cancelled: the run stopped before every row arrived.".into(),
+                    false,
+                    cx,
+                ),
+            }
+        }
         cx.notify();
+    }
+
+    fn can_export(&self) -> bool {
+        !self.result_sets.is_empty()
+            && self.pending_export.is_none()
+            && matches!(
+                self.state,
+                RunState::Finished | RunState::Paused | RunState::Stopped(_) | RunState::Failed
+            )
+    }
+
+    fn export(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_export() {
+            return;
+        }
+        let directory = self
+            .workspace
+            .upgrade()
+            .and_then(|workspace| {
+                let project = workspace.read(cx).project().read(cx);
+                project
+                    .visible_worktrees(cx)
+                    .next()
+                    .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+            })
+            .unwrap_or_else(|| paths::home_dir().clone());
+        let file_name = export::suggested_file_name(
+            &self.target.database,
+            self.started_at.unwrap_or_else(Local::now),
+        );
+        let prompt = cx.prompt_for_new_path(&directory, Some(&file_name));
+        cx.spawn_in(window, async move |this, cx| match prompt.await {
+            Ok(Ok(Some(path))) => this
+                .update_in(cx, |this, window, cx| this.export_to(path, window, cx))
+                .log_err(),
+            Ok(Err(error)) => this
+                .update(cx, |this, cx| {
+                    this.show_export_toast(format!("Export failed: {error:#}"), false, cx)
+                })
+                .log_err(),
+            Ok(Ok(None)) | Err(_) => None,
+        })
+        .detach();
+    }
+
+    /// Writes the results to `path`, fetching every remaining row first when the run is paused.
+    fn export_to(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let table = match self.active_tab {
+            Tab::Result(index) => index,
+            Tab::Messages => 0,
+        };
+        match self.state {
+            RunState::Paused => {
+                self.pending_export = Some(PendingExport { path, table });
+                self.fetch(Fetch::All, window, cx);
+            }
+            RunState::Running => self.pending_export = Some(PendingExport { path, table }),
+            RunState::Finished | RunState::Stopped(_) | RunState::Failed => {
+                self.write_export(path, table, cx)
+            }
+            RunState::Idle | RunState::Stopping => {}
+        }
+        cx.notify();
+    }
+
+    fn export_data(&self, cx: &App) -> ExportData {
+        let profile = self.profile(cx);
+        let status = match &self.state {
+            RunState::Finished => RunStatus::Completed,
+            RunState::Stopped(reason) => RunStatus::Stopped(reason.to_string()),
+            RunState::Failed => RunStatus::Failed(
+                self.error
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+            ),
+            RunState::Idle | RunState::Running | RunState::Paused | RunState::Stopping => {
+                RunStatus::Stopped("Still running".into())
+            }
+        };
+        ExportData {
+            connection: profile
+                .as_ref()
+                .map(|profile| profile.name.clone())
+                .unwrap_or_default(),
+            environment: profile
+                .as_ref()
+                .map(|profile| profile.environment.clone())
+                .unwrap_or_default(),
+            database: self.target.database.clone(),
+            started_at: self.started_at,
+            elapsed: self.elapsed,
+            status,
+            sql: self.sql.clone(),
+            result_sets: self
+                .result_sets
+                .iter()
+                .map(|set| set.result.clone())
+                .collect(),
+            messages: self.messages.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    fn write_export(&mut self, path: PathBuf, table: usize, cx: &mut Context<Self>) {
+        let data = self.export_data(cx);
+        let format = ExportFormat::from_path(&path);
+        let write = cx.background_spawn({
+            let path = path.clone();
+            async move {
+                let text = export::render(format, &data, table);
+                std::fs::write(&path, text)
+                    .with_context(|| format!("writing {}", path.display()))?;
+                anyhow::Ok(export::exported_row_count(format, &data, table))
+            }
+        });
+        self.export_task = Some(cx.spawn(async move |this, cx| {
+            let (message, succeeded) = match write.await {
+                Ok(rows) => (
+                    format!("Exported {} to {}", row_count_text(rows), path.display()),
+                    true,
+                ),
+                Err(error) => (format!("Export failed: {error:#}"), false),
+            };
+            this.update(cx, |this, cx| {
+                this.show_export_toast(message, succeeded, cx)
+            })
+            .log_err();
+        }));
+    }
+
+    /// Failures stay up until dismissed, so they aren't missed.
+    fn show_export_toast(&self, message: String, autohide: bool, cx: &mut App) {
+        struct ExportToast;
+        let toast = Toast::new(NotificationId::unique::<ExportToast>(), message);
+        let toast = if autohide { toast.autohide() } else { toast };
+        self.workspace
+            .update(cx, |workspace, cx| workspace.show_toast(toast, cx))
+            .log_err();
     }
 
     fn rebuild_messages(&mut self) {
@@ -1272,15 +1446,30 @@ impl QueryResultsView {
                 })),
             );
         }
-        tabs = tabs.child(
-            Button::new("database-messages-tab", "Messages")
-                .label_size(LabelSize::Small)
-                .toggle_state(self.active_tab == Tab::Messages)
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.active_tab = Tab::Messages;
-                    cx.notify();
-                })),
-        );
+        tabs = tabs
+            .child(
+                Button::new("database-messages-tab", "Messages")
+                    .label_size(LabelSize::Small)
+                    .toggle_state(self.active_tab == Tab::Messages)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.active_tab = Tab::Messages;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                IconButton::new("database-export", IconName::Download)
+                    .icon_size(IconSize::Small)
+                    .disabled(!self.can_export())
+                    .tooltip(Tooltip::for_action_title(
+                        if self.state == RunState::Paused {
+                            "Fetch Every Row and Export…"
+                        } else {
+                            "Export Results…"
+                        },
+                        &ExportResults,
+                    ))
+                    .on_click(cx.listener(|this, _, window, cx| this.export(window, cx))),
+            );
 
         h_flex()
             .w_full()
@@ -1568,6 +1757,7 @@ impl Render for QueryResultsView {
                     this.fetch(Fetch::All, window, cx)
                 }),
             )
+            .on_action(cx.listener(|this, _: &ExportResults, window, cx| this.export(window, cx)))
             .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
                 if this.editing.is_some() {
                     this.commit_edit(window, cx);
@@ -1694,6 +1884,20 @@ impl QueryResultsView {
             RunState::Stopped(reason) => Some(reason.to_string()),
             _ => None,
         }
+    }
+
+    pub(crate) fn export_to_for_test(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.export_to(path, window, cx);
+    }
+
+    pub(crate) fn show_result_tab_for_test(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.active_tab = Tab::Result(index);
+        cx.notify();
     }
 
     pub(crate) fn fetch_for_test(

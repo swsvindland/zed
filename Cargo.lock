@@ -4717,6 +4717,7 @@ dependencies = [
  "project",
  "serde_json",
  "tabular_data_preview",
+ "tempfile",
  "toml 0.9.8",
  "tree-sitter",
  "tree-sitter-sequel",

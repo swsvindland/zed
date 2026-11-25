@@ -30,7 +30,7 @@ open transaction through a savepoint.
 | .NET tests | Gutter "run test" through `dotnet test --filter` | **No test explorer**; legacy (vstest) test projects can't run |
 | NuGet | Browse, install, update and remove against nuget.org | No `nuget.config` or private feeds; `packages.config` read-only |
 | Web Forms | `.aspx`/`.ascx`/`.master` highlighting with C# injection; Web.config language | No code-behind navigation; no completion |
-| Databases | SQL Server and Postgres; LocalDB; environments with prod coloring; schema tree; consoles with lasting session state and `GO` batches; schema-aware SQL completion; Stop, timeouts, 500-row paging, NULL cells; editable grid with reviewed, transactional push | No routines or DDL, no history, no export, no Entra ID; Postgres push still commits an open transaction block |
+| Databases | SQL Server and Postgres; LocalDB; environments with prod coloring; schema tree; consoles with lasting session state and `GO` batches; schema-aware SQL completion; Stop, timeouts, 500-row paging, NULL cells; editable grid with reviewed, transactional push; export of a run's results to Markdown, JSON, CSV or TSV | No routines or DDL, no history, no range copy, no Entra ID; Postgres push still commits an open transaction block |
 | Front end | Upstream Zed: vtsls, ESLint, Prettier, js-debug (Chrome/Node), package.json script tasks, Jest and Vitest runnables | No test explorer; no HTTP client; no compound "API + Vite" run |
 | VCS | Git (upstream); Subversion working copies (status, diff, blame, commit, update, log) | SVN branches/switch, merge, properties, file-history changes |
 | General | JetBrains base keymap; outline, call hierarchy, bookmarks (upstream) | No local history; no JetBrains-style bindings for fork actions |
@@ -153,7 +153,8 @@ thanks to the vendored tiberius patch. The original plan follows.
 ### 2.4 Query history and export (M)
 
 - History: keep every executed statement per connection (text, time, duration, row count, error) in a local SQLite store. Add a searchable picker and "re-open in console".
-- Export: export a result set or a range selection as CSV, TSV, JSON, Markdown or SQL `INSERT`s. Copy a range to the clipboard as TSV, which pastes into Excel. Upstream just added range selection to the grid.
+- Export: done for whole runs. **Export…** in the results header saves every result set as Markdown or JSON, or the open one as CSV or TSV. It fetches a paused run's remaining rows first.
+- Still to do: export or copy a range selection (TSV pastes into Excel), and SQL `INSERT` output. Upstream just added range selection to the grid.
 
 ### 2.5 Transactions and prod guard rails (M)
 

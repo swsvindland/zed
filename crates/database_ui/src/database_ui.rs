@@ -36,7 +36,7 @@ pub use console::{
     RefreshCompletionMetadata, RunScript, RunStatement, SelectConnection, default_key_bindings,
 };
 pub use database_panel::DatabasePanel;
-pub use results_view::{FetchAllRows, FetchNextPage, StopStatement};
+pub use results_view::{ExportResults, FetchAllRows, FetchNextPage, StopStatement};
 
 gpui::actions!(
     database,
