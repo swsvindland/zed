@@ -4702,6 +4702,7 @@ name = "database_ui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "database",
  "editor",
  "futures 0.3.34",
@@ -4714,7 +4715,9 @@ dependencies = [
  "paths",
  "picker",
  "project",
+ "serde_json",
  "tabular_data_preview",
+ "tempfile",
  "toml 0.9.8",
  "tree-sitter",
  "tree-sitter-sequel",

@@ -14,6 +14,7 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
+chrono = { workspace = true, features = ["clock"] }
 database.workspace = true
 editor.workspace = true
 futures.workspace = true
@@ -26,6 +27,7 @@ menu.workspace = true
 paths.workspace = true
 picker.workspace = true
 project.workspace = true
+serde_json.workspace = true
 tabular_data_preview.workspace = true
 toml.workspace = true
 tree-sitter-sequel = "0.3.11"
@@ -38,5 +40,6 @@ workspace.workspace = true
 editor = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 project = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true
 tree-sitter.workspace = true
 workspace = { workspace = true, features = ["test-support"] }

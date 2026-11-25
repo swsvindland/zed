@@ -14,7 +14,7 @@ use tabular_data_preview::types::{AnyColumn, DataCellId, DataRow, TableCell};
 use workspace::{AppState, MultiWorkspace, Workspace};
 
 use crate::{
-    DatabasePanel, DatabaseStore, RunScript, RunStatement, StopStatement,
+    DatabasePanel, DatabaseStore, ExportResults, RunScript, RunStatement, StopStatement,
     console::{self, ConsoleTarget},
     database_panel::NodeKey,
     push_modal::PushReviewModal,
@@ -691,4 +691,183 @@ async fn test_paging_stop_null_and_completion(cx: &mut TestAppContext) {
     })
     .await;
     completion_labels(&editor, "SELECT o.| FROM dbo.PageOrders o", "Extra", cx).await;
+}
+
+#[gpui::test]
+async fn test_export_results(cx: &mut TestAppContext) {
+    let Some(mut paged) = profile("ui-test-export", "dev") else {
+        eprintln!("ZED_DATABASE_TEST_SQL_SERVER not set; skipping");
+        return;
+    };
+    paged.fetch_limit = Some(2);
+    cx.executor().allow_parking();
+    let app_state = cx.update(|cx| {
+        let app_state = AppState::test(cx);
+        editor::init(cx);
+        gpui_tokio::init(cx);
+        crate::init(cx);
+        app_state
+    });
+    let fs = FakeFs::new(cx.executor());
+    let project = Project::test(fs, [], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace =
+        multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+    let _ = app_state;
+
+    let store = cx.update(|_, cx| DatabaseStore::global(cx));
+    store.update(cx, |store, cx| {
+        store.set_connections_for_test(
+            ConnectionsFile {
+                connections: vec![paged.clone()],
+            },
+            cx,
+        )
+    });
+    let master = PoolKey {
+        connection_id: paged.id.clone(),
+        database: "master".into(),
+        session: "setup".into(),
+    };
+    run_sql(
+        &store,
+        master,
+        "IF DB_ID('ZedDatabaseUiTest') IS NULL CREATE DATABASE ZedDatabaseUiTest",
+        cx,
+    )
+    .await;
+    let setup = PoolKey {
+        connection_id: paged.id.clone(),
+        database: DATABASE.into(),
+        session: "setup".into(),
+    };
+    run_sql(
+        &store,
+        setup,
+        "DROP TABLE IF EXISTS dbo.ExportCustomers;\n\
+         CREATE TABLE dbo.ExportCustomers (Id int PRIMARY KEY, Name nvarchar(50) NULL);\n\
+         INSERT INTO dbo.ExportCustomers VALUES \
+           (1, N'Ada'), (2, NULL), (3, N''), (4, N'Grace'), (5, N'Linus')",
+        cx,
+    )
+    .await;
+
+    let editor = workspace.update_in(cx, |workspace, window, cx| {
+        let buffer = project.update(cx, |project, cx| {
+            project.create_local_buffer(
+                "SELECT Id, Name FROM dbo.ExportCustomers ORDER BY Id;\n\
+                 SELECT Name FROM dbo.ExportCustomers ORDER BY Id DESC",
+                None,
+                false,
+                cx,
+            )
+        });
+        let editor = cx.new(|cx| Editor::for_buffer(buffer, Some(project.clone()), window, cx));
+        workspace.add_item_to_active_pane(Box::new(editor.clone()), None, true, window, cx);
+        editor
+    });
+    cx.update(|_, cx| {
+        console::bind_editor(
+            &editor,
+            ConsoleTarget {
+                connection_id: paged.id.clone(),
+                database: DATABASE.into(),
+            },
+            cx,
+        )
+    });
+    let directory = tempfile::tempdir().unwrap();
+
+    // Exporting a run paused at the fetch limit fetches every row before writing, including the
+    // rows of a later result set that reaches the limit too.
+    cx.dispatch_action(RunScript);
+    let results = wait_for_results(&workspace, cx).await;
+    wait_until(cx, "the first page", |cx| {
+        results.read_with(cx, |results, _| results.is_paused_for_test())
+    })
+    .await;
+    let markdown_path = directory.path().join("out.md");
+    results.update_in(cx, |results, window, cx| {
+        results.export_to_for_test(markdown_path.clone(), window, cx)
+    });
+    wait_until(cx, "the Markdown export", |cx| {
+        !results.read_with(cx, |results, _| results.is_busy_for_test()) && markdown_path.exists()
+    })
+    .await;
+    let markdown = std::fs::read_to_string(&markdown_path).unwrap();
+    for expected in [
+        "## Result 1 (5 rows)",
+        "| 2 | NULL |\n",
+        "| 3 |  |\n",
+        "## Result 2 (5 rows)",
+        "| Name |\n| --- |\n| Linus |\n| Grace |\n|  |\n| NULL |\n| Ada |\n",
+    ] {
+        assert!(
+            markdown.contains(expected),
+            "missing {expected:?} in\n{markdown}"
+        );
+    }
+
+    // CSV holds one table: the result tab that is open.
+    let csv_path = directory.path().join("out.csv");
+    results.update_in(cx, |results, window, cx| {
+        results.show_result_tab_for_test(1, cx);
+        results.export_to_for_test(csv_path.clone(), window, cx)
+    });
+    wait_until(cx, "the CSV export", |_| csv_path.exists()).await;
+    assert_eq!(
+        std::fs::read_to_string(&csv_path).unwrap(),
+        "\u{feff}Name\r\nLinus\r\nGrace\r\n\"\"\r\n\r\nAda\r\n"
+    );
+
+    // The action also works from the console, where focus sits after a run.
+    let json_path = directory.path().join("out.json");
+    cx.update(|window, cx| window.focus(&editor.focus_handle(cx), cx));
+    cx.dispatch_action(ExportResults);
+    cx.run_until_parked();
+    cx.simulate_new_path_selection(|_| Some(json_path.clone()));
+    wait_until(cx, "the JSON export", |_| json_path.exists()).await;
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
+    assert_eq!(json["status"], "completed");
+    assert_eq!(json["result_sets"][1]["rows"].as_array().unwrap().len(), 5);
+
+    // Running again while an export waits for rows drops that export, so the rerun finishing
+    // writes nothing.
+    cx.update(|window, cx| window.focus(&editor.focus_handle(cx), cx));
+    cx.dispatch_action(RunScript);
+    wait_until(cx, "the first page again", |cx| {
+        results.read_with(cx, |results, _| results.is_paused_for_test())
+    })
+    .await;
+    let dropped_path = directory.path().join("dropped.json");
+    results.update_in(cx, |results, window, cx| {
+        results.export_to_for_test(dropped_path.clone(), window, cx)
+    });
+    cx.update(|window, cx| window.focus(&editor.focus_handle(cx), cx));
+    cx.dispatch_action(RunScript);
+    for _ in 0..20 {
+        wait_until(cx, "the rerun to pause or finish", |cx| {
+            results.read_with(cx, |results, _| {
+                results.is_paused_for_test() || !results.is_busy_for_test()
+            })
+        })
+        .await;
+        if !results.read_with(cx, |results, _| results.is_busy_for_test()) {
+            break;
+        }
+        results.update_in(cx, |results, window, cx| {
+            results.fetch_for_test(true, window, cx)
+        });
+    }
+    wait_until(cx, "the rerun to finish", |cx| {
+        !results.read_with(cx, |results, _| results.is_busy_for_test())
+    })
+    .await;
+    for _ in 0..20 {
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!dropped_path.exists());
 }

@@ -24,7 +24,9 @@ use workspace::{
 use crate::{
     DatabaseStore, completion_provider,
     database_panel::environment_color,
-    results_view::{ActiveConsoleRuns, QueryResultsView, StopStatement},
+    results_view::{
+        ActiveConsoleRuns, ExportResults, QueryResultsView, StopStatement, export_directory,
+    },
 };
 
 gpui::actions!(
@@ -217,6 +219,19 @@ pub fn register(workspace: &mut Workspace) {
         };
         if let Some(view) = QueryResultsView::find(workspace, buffer_id, cx) {
             view.update(cx, |view, cx| view.stop_if_running(cx));
+        }
+    });
+    // Focus stays in the console after a run, so export has to be reachable from there too.
+    workspace.register_action(|workspace, _: &ExportResults, window, cx| {
+        let Some(buffer_id) = workspace
+            .active_item_as::<Editor>(cx)
+            .and_then(|editor| buffer_id(&editor, cx))
+        else {
+            return;
+        };
+        if let Some(view) = QueryResultsView::find(workspace, buffer_id, cx) {
+            let directory = export_directory(workspace, cx);
+            view.update(cx, |view, cx| view.export_from(directory, window, cx));
         }
     });
     workspace.register_action(|workspace, _: &RefreshCompletionMetadata, _, cx| {
