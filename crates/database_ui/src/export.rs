@@ -75,6 +75,23 @@ pub(crate) fn exported_row_count(format: ExportFormat, data: &ExportData, table:
     }
 }
 
+/// The notice shown once the file is written, and whether it may hide itself. A CSV can't say
+/// that its rows are incomplete, so the notice does, and stays until dismissed.
+pub(crate) fn exported_message(rows: usize, path: &Path, status: &RunStatus) -> (String, bool) {
+    let exported = format!("Exported {} to {}", row_count_text(rows), path.display());
+    match status {
+        RunStatus::Completed => (exported, true),
+        RunStatus::Stopped(_) => (
+            format!("{exported}. The run was stopped, so rows may be incomplete."),
+            false,
+        ),
+        RunStatus::Failed(_) => (
+            format!("{exported}. The run failed, so rows may be incomplete."),
+            false,
+        ),
+    }
+}
+
 pub(crate) fn suggested_file_name(database: &str, at: DateTime<Local>) -> String {
     let name = database
         .chars()
@@ -419,5 +436,29 @@ mod tests {
         assert_eq!(render(ExportFormat::Csv, &data, 7), "\u{feff}");
         assert_eq!(exported_row_count(ExportFormat::Csv, &data, 1), 1);
         assert_eq!(exported_row_count(ExportFormat::Markdown, &data, 1), 5);
+    }
+
+    #[test]
+    fn test_exported_message_flags_incomplete_runs() {
+        let path = Path::new("out.csv");
+        assert_eq!(
+            exported_message(5, path, &RunStatus::Completed),
+            ("Exported 5 rows to out.csv".to_string(), true)
+        );
+        assert_eq!(
+            exported_message(500, path, &RunStatus::Stopped("Stopped".into())),
+            (
+                "Exported 500 rows to out.csv. The run was stopped, so rows may be incomplete."
+                    .to_string(),
+                false
+            )
+        );
+        assert_eq!(
+            exported_message(1, path, &RunStatus::Failed("Timeout".into())),
+            (
+                "Exported 1 row to out.csv. The run failed, so rows may be incomplete.".to_string(),
+                false
+            )
+        );
     }
 }

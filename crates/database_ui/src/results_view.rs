@@ -455,8 +455,16 @@ impl QueryResultsView {
                 }
                 ExecutionEvent::Paused => {
                     if self.state == RunState::Running {
-                        self.state = RunState::Paused;
-                        self.paused_since = Some(Instant::now());
+                        // Fetch::All only lifts the limit for the current result set, and an
+                        // export needs every row of every later one too.
+                        if self.pending_export.is_some()
+                            && let Some(run) = &self.run
+                        {
+                            run.handle.fetch(Fetch::All);
+                        } else {
+                            self.state = RunState::Paused;
+                            self.paused_since = Some(Instant::now());
+                        }
                     }
                 }
             }
@@ -611,20 +619,25 @@ impl QueryResultsView {
     }
 
     fn export(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.can_export() {
-            return;
-        }
         let directory = self
             .workspace
             .upgrade()
-            .and_then(|workspace| {
-                let project = workspace.read(cx).project().read(cx);
-                project
-                    .visible_worktrees(cx)
-                    .next()
-                    .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
-            })
-            .unwrap_or_else(|| paths::home_dir().clone());
+            .and_then(|workspace| export_directory(workspace.read(cx), cx));
+        self.export_from(directory, window, cx);
+    }
+
+    /// Takes the dialog's starting folder from the caller, since a workspace action can't read
+    /// the workspace it is updating.
+    pub(crate) fn export_from(
+        &mut self,
+        directory: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_export() {
+            return;
+        }
+        let directory = directory.unwrap_or_else(|| paths::home_dir().clone());
         let file_name = export::suggested_file_name(
             &self.target.database,
             self.started_at.unwrap_or_else(Local::now),
@@ -704,6 +717,7 @@ impl QueryResultsView {
 
     fn write_export(&mut self, path: PathBuf, table: usize, cx: &mut Context<Self>) {
         let data = self.export_data(cx);
+        let status = data.status.clone();
         let format = ExportFormat::from_path(&path);
         let write = cx.background_spawn({
             let path = path.clone();
@@ -715,21 +729,16 @@ impl QueryResultsView {
             }
         });
         self.export_task = Some(cx.spawn(async move |this, cx| {
-            let (message, succeeded) = match write.await {
-                Ok(rows) => (
-                    format!("Exported {} to {}", row_count_text(rows), path.display()),
-                    true,
-                ),
+            let (message, autohide) = match write.await {
+                Ok(rows) => export::exported_message(rows, &path, &status),
                 Err(error) => (format!("Export failed: {error:#}"), false),
             };
-            this.update(cx, |this, cx| {
-                this.show_export_toast(message, succeeded, cx)
-            })
-            .log_err();
+            this.update(cx, |this, cx| this.show_export_toast(message, autohide, cx))
+                .log_err();
         }));
     }
 
-    /// Failures stay up until dismissed, so they aren't missed.
+    /// Failures and warnings stay up until dismissed, so they aren't missed.
     fn show_export_toast(&self, message: String, autohide: bool, cx: &mut App) {
         struct ExportToast;
         let toast = Toast::new(NotificationId::unique::<ExportToast>(), message);
@@ -1672,6 +1681,16 @@ fn cell_value(set: &ResultSetView, row: usize, column: usize) -> Option<Option<S
             .get(column)?
             .clone()
     }
+}
+
+/// The project's first folder, where exports start.
+pub(crate) fn export_directory(workspace: &Workspace, cx: &App) -> Option<PathBuf> {
+    workspace
+        .project()
+        .read(cx)
+        .visible_worktrees(cx)
+        .next()
+        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
 }
 
 pub(crate) fn row_count_text(rows: usize) -> String {

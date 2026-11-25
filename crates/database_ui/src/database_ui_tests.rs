@@ -14,7 +14,7 @@ use tabular_data_preview::types::{AnyColumn, DataCellId, DataRow, TableCell};
 use workspace::{AppState, MultiWorkspace, Workspace};
 
 use crate::{
-    DatabasePanel, DatabaseStore, RunScript, RunStatement, StopStatement,
+    DatabasePanel, DatabaseStore, ExportResults, RunScript, RunStatement, StopStatement,
     console::{self, ConsoleTarget},
     database_panel::NodeKey,
     push_modal::PushReviewModal,
@@ -757,7 +757,7 @@ async fn test_export_results(cx: &mut TestAppContext) {
         let buffer = project.update(cx, |project, cx| {
             project.create_local_buffer(
                 "SELECT Id, Name FROM dbo.ExportCustomers ORDER BY Id;\n\
-                 SELECT COUNT(*) AS Total FROM dbo.ExportCustomers",
+                 SELECT Name FROM dbo.ExportCustomers ORDER BY Id DESC",
                 None,
                 false,
                 cx,
@@ -779,7 +779,8 @@ async fn test_export_results(cx: &mut TestAppContext) {
     });
     let directory = tempfile::tempdir().unwrap();
 
-    // Exporting a run paused at the fetch limit fetches every row before writing.
+    // Exporting a run paused at the fetch limit fetches every row before writing, including the
+    // rows of a later result set that reaches the limit too.
     cx.dispatch_action(RunScript);
     let results = wait_for_results(&workspace, cx).await;
     wait_until(cx, "the first page", |cx| {
@@ -799,8 +800,8 @@ async fn test_export_results(cx: &mut TestAppContext) {
         "## Result 1 (5 rows)",
         "| 2 | NULL |\n",
         "| 3 |  |\n",
-        "## Result 2 (1 row)",
-        "| Total |\n| --- |\n| 5 |\n",
+        "## Result 2 (5 rows)",
+        "| Name |\n| --- |\n| Linus |\n| Grace |\n|  |\n| NULL |\n| Ada |\n",
     ] {
         assert!(
             markdown.contains(expected),
@@ -817,10 +818,23 @@ async fn test_export_results(cx: &mut TestAppContext) {
     wait_until(cx, "the CSV export", |_| csv_path.exists()).await;
     assert_eq!(
         std::fs::read_to_string(&csv_path).unwrap(),
-        "\u{feff}Total\r\n5\r\n"
+        "\u{feff}Name\r\nLinus\r\nGrace\r\n\"\"\r\n\r\nAda\r\n"
     );
 
-    // Running again while an export waits for rows drops that export.
+    // The action also works from the console, where focus sits after a run.
+    let json_path = directory.path().join("out.json");
+    cx.update(|window, cx| window.focus(&editor.focus_handle(cx), cx));
+    cx.dispatch_action(ExportResults);
+    cx.run_until_parked();
+    cx.simulate_new_path_selection(|_| Some(json_path.clone()));
+    wait_until(cx, "the JSON export", |_| json_path.exists()).await;
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
+    assert_eq!(json["status"], "completed");
+    assert_eq!(json["result_sets"][1]["rows"].as_array().unwrap().len(), 5);
+
+    // Running again while an export waits for rows drops that export, so the rerun finishing
+    // writes nothing.
     cx.update(|window, cx| window.focus(&editor.focus_handle(cx), cx));
     cx.dispatch_action(RunScript);
     wait_until(cx, "the first page again", |cx| {
@@ -833,14 +847,27 @@ async fn test_export_results(cx: &mut TestAppContext) {
     });
     cx.update(|window, cx| window.focus(&editor.focus_handle(cx), cx));
     cx.dispatch_action(RunScript);
-    wait_until(cx, "the rerun's first page", |cx| {
-        results.read_with(cx, |results, _| results.is_paused_for_test())
-    })
-    .await;
-    results.update(cx, |results, cx| results.stop_if_running(cx));
-    wait_until(cx, "the rerun to stop", |cx| {
+    for _ in 0..20 {
+        wait_until(cx, "the rerun to pause or finish", |cx| {
+            results.read_with(cx, |results, _| {
+                results.is_paused_for_test() || !results.is_busy_for_test()
+            })
+        })
+        .await;
+        if !results.read_with(cx, |results, _| results.is_busy_for_test()) {
+            break;
+        }
+        results.update_in(cx, |results, window, cx| {
+            results.fetch_for_test(true, window, cx)
+        });
+    }
+    wait_until(cx, "the rerun to finish", |cx| {
         !results.read_with(cx, |results, _| results.is_busy_for_test())
     })
     .await;
+    for _ in 0..20 {
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(20));
+    }
     assert!(!dropped_path.exists());
 }
