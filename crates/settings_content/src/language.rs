@@ -103,19 +103,6 @@ pub enum EditPredictionProvider {
 }
 
 impl EditPredictionProvider {
-    pub fn is_zed(&self) -> bool {
-        match self {
-            EditPredictionProvider::Zed => true,
-            EditPredictionProvider::None
-            | EditPredictionProvider::Copilot
-            | EditPredictionProvider::Supermaven
-            | EditPredictionProvider::Codestral
-            | EditPredictionProvider::Ollama
-            | EditPredictionProvider::OpenAiCompatibleApi
-            | EditPredictionProvider::Mercury => false,
-        }
-    }
-
     pub fn display_name(&self) -> Option<&'static str> {
         match self {
             EditPredictionProvider::Zed => Some("Zed AI"),

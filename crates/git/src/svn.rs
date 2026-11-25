@@ -853,19 +853,23 @@ impl GitRepository for SvnRepository {
                     has_parent: false,
                 }
             });
-            Ok(vec![Branch {
-                is_head: true,
-                ref_name: format!("refs/heads/{name}").into(),
-                upstream: Some(Upstream {
-                    ref_name: format!("refs/remotes/{REMOTE_NAME}/{name}").into(),
-                    tracking: UpstreamTracking::Tracked(UpstreamTrackingStatus {
-                        ahead: 0,
-                        behind,
+            Ok(BranchesScanResult {
+                branches: vec![Branch {
+                    is_head: true,
+                    ref_name: format!("refs/heads/{name}").into(),
+                    upstream: Some(Upstream {
+                        ref_name: format!("refs/remotes/{REMOTE_NAME}/{name}").into(),
+                        tracking: UpstreamTracking::Tracked(UpstreamTrackingStatus {
+                            ahead: 0,
+                            behind,
+                        }),
                     }),
-                }),
-                most_recent_commit,
-            }]
-            .into())
+                    most_recent_commit,
+                }],
+                error: None,
+                // Subversion has no remote HEAD to point at a default branch.
+                remote_default_branch: None,
+            })
         }
         .boxed()
     }
