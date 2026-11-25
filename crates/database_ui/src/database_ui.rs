@@ -7,6 +7,7 @@ mod console;
 mod database_panel;
 #[cfg(test)]
 mod database_ui_tests;
+mod export;
 mod push_modal;
 mod results_view;
 mod sql_language;

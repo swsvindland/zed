@@ -1485,7 +1485,7 @@ fn cell_value(set: &ResultSetView, row: usize, column: usize) -> Option<Option<S
     }
 }
 
-fn row_count_text(rows: usize) -> String {
+pub(crate) fn row_count_text(rows: usize) -> String {
     format!("{rows} {}", if rows == 1 { "row" } else { "rows" })
 }
 
@@ -1539,7 +1539,7 @@ fn table_content(set: &ResultSetView) -> TableLikeContent {
     }
 }
 
-fn format_duration(duration: Duration) -> String {
+pub(crate) fn format_duration(duration: Duration) -> String {
     if duration.as_secs() >= 1 {
         format!("{:.2} s", duration.as_secs_f64())
     } else {
